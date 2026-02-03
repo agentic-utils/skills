@@ -27,6 +27,34 @@ cd ~/Code/monorepo/my-python-project && claude
 
 This ensures ty uses the correct project's `.venv` and `pyproject.toml`.
 
+## Testing
+
+After installing, restart Claude Code. Create a file with type errors:
+
+```python
+# test.py
+x: int = "not an int"
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+result: str = add(1, 2)
+```
+
+Verify the LSP is running:
+
+```bash
+ps aux | grep "ty server"
+```
+
+Edit or read the file - diagnostics should appear in system reminders:
+
+```
+test.py:
+  ✘ [Line 2:10] Object of type `Literal["not an int"]` is not assignable to `int` [invalid-assignment] (ty)
+  ✘ [Line 7:15] Object of type `int` is not assignable to `str` [invalid-assignment] (ty)
+```
+
 ## More Information
 - [ty on GitHub](https://github.com/astral-sh/ty)
 - [ty Documentation](https://docs.astral.sh/ty/)
