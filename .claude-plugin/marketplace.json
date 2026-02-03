@@ -9,33 +9,14 @@
       "description": "Python language server (ty) for Claude Code",
       "version": "1.0.0",
       "source": "./plugins/ty-lsp",
-      "category": "development",
-      "lspServers": {
-        "ty": {
-          "command": "${CLAUDE_PLUGIN_ROOT}/plugins/ty-lsp/bin/ty-wrapper",
-          "args": [],
-          "extensionToLanguage": {
-            ".py": "python",
-            ".pyi": "python"
-          }
-        }
-      }
+      "category": "development"
     },
     {
       "name": "svelte-lsp",
       "description": "Svelte language server for Claude Code",
       "version": "1.0.0",
       "source": "./plugins/svelte-lsp",
-      "category": "development",
-      "lspServers": {
-        "svelte": {
-          "command": "svelteserver",
-          "args": ["--stdio"],
-          "extensionToLanguage": {
-            ".svelte": "svelte"
-          }
-        }
-      }
+      "category": "development"
     }
   ]
 }

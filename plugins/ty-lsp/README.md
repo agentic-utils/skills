@@ -5,27 +5,13 @@ Python language server (ty) for Claude Code, providing static type checking and 
 ## Supported Extensions
 `.py`, `.pyi`
 
-## Installation
+## Requirements
 
-Install ty globally:
+- [uv](https://docs.astral.sh/uv/) must be installed
 
-```bash
-uv tool install ty@latest
-```
+The LSP is automatically installed via `uvx ty@latest server` on first use - no manual installation required.
 
-Or with pip:
-
-```bash
-pip install ty
-```
-
-## Virtual Environment Detection
-
-The plugin automatically detects and uses project virtual environments:
-
-1. Walks up from the current working directory to find `pyproject.toml`
-2. Activates `.venv/bin/activate` if found in that project root
-3. Changes to the project root so ty discovers `pyproject.toml` configuration
+## Notes
 
 ### Monorepo Usage
 

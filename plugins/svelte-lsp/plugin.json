@@ -1,0 +1,19 @@
+{
+  "name": "svelte-lsp",
+  "version": "1.0.0",
+  "description": "Svelte language server for Claude Code",
+  "author": {
+    "name": "agentic-utils"
+  },
+  "homepage": "https://svelte.dev",
+  "keywords": ["svelte", "lsp", "language-server"],
+  "lspServers": {
+    "svelte": {
+      "command": "npx",
+      "args": ["svelte-language-server", "--stdio"],
+      "extensionToLanguage": {
+        ".svelte": "svelte"
+      }
+    }
+  }
+}

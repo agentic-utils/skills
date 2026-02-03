@@ -5,13 +5,11 @@ Svelte language server for Claude Code, providing code intelligence for Svelte c
 ## Supported Extensions
 `.svelte`
 
-## Installation
+## Requirements
 
-Install svelte-language-server globally:
+- Node.js and npm must be installed
 
-```bash
-npm install -g svelte-language-server
-```
+The LSP is automatically installed via `npx svelte-language-server` on first use - no manual installation required.
 
 ## More Information
 - [svelte-language-server on npm](https://www.npmjs.com/package/svelte-language-server)
