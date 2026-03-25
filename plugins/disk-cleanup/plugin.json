@@ -1,0 +1,10 @@
+{
+  "name": "disk-cleanup",
+  "version": "1.0.0",
+  "description": "Scan for and clean up disk space on macOS. Finds Docker waste, dev caches, stale worktrees, Python venvs, orphaned app data, and more.",
+  "author": {
+    "name": "agentic-utils"
+  },
+  "homepage": "https://github.com/agentic-utils/claude-plugins",
+  "keywords": ["macos", "disk", "cleanup", "cache", "docker", "maintenance"]
+}
