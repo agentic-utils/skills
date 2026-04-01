@@ -4,19 +4,19 @@ Scan for and clean up disk space on macOS. Finds Docker waste, dev caches, stale
 
 ## What it cleans
 
-| Category | Examples |
-|----------|----------|
-| Docker | Images, volumes, build cache |
-| Dev caches | npm, yarn, pip, poetry, go, homebrew, node-gyp |
-| Python venvs | `.venv` directories (recreatable) |
-| Git worktrees | `.worktrees/` directories (checks for uncommitted changes first) |
-| App caches | Spotify, Brave, Playwright, etc. |
-| iOS simulators | CoreSimulator, XCPGDevices |
+| Category          | Examples                                                              |
+| ----------------- | --------------------------------------------------------------------- |
+| Docker            | Images, volumes, build cache                                          |
+| Dev caches        | npm, yarn, pip, poetry, go, homebrew, node-gyp                        |
+| Python venvs      | `.venv` directories (recreatable)                                     |
+| Git worktrees     | `.worktrees/` directories (checks for uncommitted changes first)      |
+| App caches        | Spotify, Brave, Playwright, etc.                                      |
+| iOS simulators    | CoreSimulator, XCPGDevices                                            |
 | Orphaned app data | Leftover data from uninstalled apps (LM Studio, Ollama, Cursor, etc.) |
 
 ## Usage
 
-```
+```text
 /disk-cleanup
 ```
 

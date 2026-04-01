@@ -3,6 +3,7 @@
 Svelte language server for Claude Code, providing code intelligence for Svelte components.
 
 ## Supported Extensions
+
 `.svelte`
 
 ## Requirements
@@ -30,11 +31,12 @@ ps aux | grep svelte
 
 Edit or read the file - diagnostics should appear in system reminders:
 
-```
+```text
 test.svelte:
   ✘ [Line 3:7] Type 'string' is not assignable to type 'number'. [2322] (ts)
 ```
 
 ## More Information
+
 - [svelte-language-server on npm](https://www.npmjs.com/package/svelte-language-server)
 - [Svelte Documentation](https://svelte.dev/docs)
