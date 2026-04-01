@@ -62,12 +62,13 @@ done | sort -hr | awk -F'\t' '{size=$1; if (size ~ /[0-9.]+G/ || (size ~ /[0-9.]
 
 Present results as a numbered table:
 
-```
+```text
 | # | Category | Size | Risk | Command |
 |---|----------|------|------|---------|
 ```
 
 Risk levels:
+
 - **Safe** — caches that are automatically rebuilt (npm, pip, poetry, go, brew, yarn)
 - **Safe** — Docker build cache, dangling images, unused volumes
 - **Safe** — Python .venvs (recreatable with `uv sync`, `poetry install`, or `pip install`)
@@ -79,6 +80,7 @@ Risk levels:
 ### Phase 2: Choose
 
 Use AskUserQuestion to ask the user which categories to clean. Offer options like:
+
 1. Clean all safe items
 2. Clean specific categories (let me pick)
 3. Just show me the commands
@@ -88,12 +90,14 @@ Use AskUserQuestion to ask the user which categories to clean. Offer options lik
 For each selected category, run the appropriate cleanup commands.
 
 #### Docker
+
 ```bash
 docker system prune -af --volumes
 docker builder prune -af
 ```
 
 #### Dev caches
+
 ```bash
 npm cache clean --force
 yarn cache clean
@@ -105,33 +109,42 @@ rm -rf ~/Library/Caches/node-gyp
 ```
 
 #### Python venvs
+
 ```bash
 # List and confirm before removing
 find ~ -name ".venv" -type d -maxdepth 5 -exec rm -rf {} +
 ```
 
 #### Git worktrees
+
 Before removing, check each worktree for uncommitted changes:
+
 ```bash
 # For each .worktrees directory, check git status
 cd <worktree> && git status --porcelain
 ```
+
 Only remove worktrees with clean working trees. Warn about dirty ones.
 
 #### App caches
+
 Remove the large app cache directories identified in the scan.
+
 - Browser caches require the browser to be closed first
 - Skip any caches the user wants to keep
 - Use `rm -rf ~/Library/Caches/<dirname>` for each selected cache
 
 #### iOS/Xcode simulators
+
 ```bash
 rm -rf ~/Library/Developer/CoreSimulator
 rm -rf ~/Library/Developer/XCPGDevices
 ```
 
 #### Orphaned app data
+
 Only remove directories for applications that are confirmed NOT installed:
+
 - Check `/Applications` for the corresponding `.app` bundle before removing
 - Remove both the dotdir (`~/.appname`) and `~/Library/Application Support/AppName` if the app is absent
 - Ask the user to confirm before removing any Application Support directories

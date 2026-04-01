@@ -3,6 +3,7 @@
 Python language server (ty) for Claude Code, providing static type checking and code intelligence.
 
 ## Supported Extensions
+
 `.py`, `.pyi`
 
 ## Requirements
@@ -49,12 +50,13 @@ ps aux | grep "ty server"
 
 Edit or read the file - diagnostics should appear in system reminders:
 
-```
+```text
 test.py:
   ✘ [Line 2:10] Object of type `Literal["not an int"]` is not assignable to `int` [invalid-assignment] (ty)
   ✘ [Line 7:15] Object of type `int` is not assignable to `str` [invalid-assignment] (ty)
 ```
 
 ## More Information
+
 - [ty on GitHub](https://github.com/astral-sh/ty)
 - [ty Documentation](https://docs.astral.sh/ty/)

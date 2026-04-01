@@ -1,0 +1,5 @@
+[global]
+disable = [
+    "MD013",  # Line length - tables and code examples regularly exceed 80 chars
+    "MD036",  # Emphasis as heading - used intentionally for migration step labels
+]
