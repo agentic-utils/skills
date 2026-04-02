@@ -1,6 +1,6 @@
 # agentic-utils Skills
 
-Custom Claude Code plugin marketplace.
+Skills and plugins for AI coding assistants. Works with Claude Code, Codex, Cursor, and any tool that reads instruction files.
 
 ## Installation
 
