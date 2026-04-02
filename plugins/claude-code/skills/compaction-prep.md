@@ -1,6 +1,6 @@
 ---
 name: compaction-prep
-description: Checkpoint mid-task state before context limits force compaction. Writes a handoff note so the compacted session picks up exactly where it left off.
+description: Checkpoint mid-task state before context limits hit. Writes a handoff note so the session resumes exactly where it left off after a context reset or new session.
 metadata:
   trigger: When context is getting long, before a complex multi-step task, or when asked to "prep for compaction", "save state", "checkpoint", "context is filling up"
   author: agentic-utils
@@ -8,25 +8,30 @@ metadata:
 
 # Compaction Prep
 
-When Claude Code hits ~95% context, it compacts: a forked agent summarises the conversation, the original session restores from that summary plus up to 5 files. If you are mid-task and compaction hits without preparation, the restored session may not have enough context to continue cleanly.
+When context gets long enough, AI assistants summarise the conversation and start fresh. State held only in the conversation — intermediate reasoning, file edit history, decisions made — may not survive. If you are mid-task when this happens, the resumed session may not have enough context to continue cleanly.
 
-This skill creates an explicit checkpoint so the post-compaction session picks up exactly where it left off.
+This skill creates an explicit checkpoint so the session resumes exactly where it left off.
 
-## What compaction restores
+## What survives a context reset
 
-The compacted session gets:
+Typically survives:
 
-- A summarised conversation (tool calls become counts, not full content)
-- Up to 5 explicitly named files (restored verbatim)
-- CLAUDE.md and active memory files (always loaded fresh)
+- A summarised version of the conversation
+- Memory and config files loaded at session start
+- Files explicitly referenced or recently edited
 
-It does NOT get: full tool call results, intermediate reasoning, the list of files being edited, anything held only in conversation.
+Typically does not survive:
+
+- Full tool call results
+- Intermediate reasoning steps
+- The list of files being actively edited
+- Anything held only in conversation
 
 ## Process
 
 ### Step 1: Write a checkpoint
 
-Create `.claude/checkpoint.md`:
+Create a checkpoint file (e.g. `.ai/checkpoint.md` or `checkpoint.md`):
 
 ```markdown
 # Checkpoint
@@ -48,18 +53,16 @@ Create `.claude/checkpoint.md`:
 
 - [Anything already tried and failed, to avoid redoing it]
 
-## Restore these files
+## Key files
 
-1. `path/to/most-important.ts`
-2. `path/to/second.ts`
-3. `path/to/third.ts`
-4. `path/to/fourth.ts`
-5. `path/to/fifth.ts`
+- `path/to/most-important.ts`
+- `path/to/second.ts`
+- `path/to/third.ts`
 ```
 
-### Step 2: Choose the 5 restoration files
+### Step 2: Identify key files
 
-Priority order:
+Which files, if loaded at the start of the next session, would give enough context to continue? Prioritise:
 
 1. Files with uncommitted changes
 2. The file that is the focus of the current task
@@ -67,14 +70,14 @@ Priority order:
 4. Test files if the task involves making tests pass
 5. Config files if the task involves configuration
 
-### Step 3: Reference the checkpoint from CLAUDE.md
+### Step 3: Reference the checkpoint from your memory config
 
-Add to the project's CLAUDE.md so it loads after compaction:
+Add a pointer to the checkpoint in whatever config or memory file the AI loads at session start (e.g. `CLAUDE.md`, `AGENTS.md`):
 
 ```markdown
 ## In-progress work
 
-See `.claude/checkpoint.md` for current task state.
+See `checkpoint.md` for current task state.
 ```
 
 Remove this line once the task completes.
@@ -84,11 +87,9 @@ Remove this line once the task completes.
 For long-running tasks that should survive beyond this session:
 
 ```bash
-git add .claude/checkpoint.md && git commit -m "chore: checkpoint mid-task state"
+git add checkpoint.md && git commit -m "chore: checkpoint mid-task state"
 ```
 
-## After compaction
+## After resuming
 
-The restored session loads CLAUDE.md (which references the checkpoint) and the 5 listed files. Read `.claude/checkpoint.md` and continue from **Next step**.
-
-Once the task is complete, delete `.claude/checkpoint.md` and remove the CLAUDE.md reference.
+Read the checkpoint file and continue from **Next step**. Once the task is complete, delete the checkpoint and remove the reference from the memory config.

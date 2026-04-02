@@ -2,28 +2,28 @@
 name: dream
 description: Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm. Removes stale entries, merges duplicates, and surfaces missing learnings from recent work.
 metadata:
-  trigger: When asked to "dream", "consolidate memory", "clean up CLAUDE.md", "tidy up memory", or when memory files have grown stale or bloated
+  trigger: When asked to "dream", "consolidate memory", "clean up memory", "tidy up memory", or when memory files have grown stale or bloated
   author: agentic-utils
 ---
 
 # Dream
 
-Consolidate and prune memory files on demand. Applies the same 4-phase algorithm Claude Code uses internally for background memory consolidation — normally only triggered automatically after 24 hours and 5 sessions, but available here on demand.
+Consolidate and prune memory files on demand using a 4-phase process.
 
 ## When to run
 
 - Memory files have grown large with outdated or overlapping entries
 - A major project phase just completed and learnings should be captured
 - Memory references are pointing to things that no longer exist
-- Explicitly asked: "dream", "consolidate memory", "clean up CLAUDE.md"
+- Explicitly asked: "dream", "consolidate memory", "clean up memory"
 
 ## Phase 1: Orient
 
-Read every memory file relevant to this project:
+Read every memory file relevant to this project. Look for:
 
-- `CLAUDE.md` in the current directory and parent directories
-- Any `MEMORY.md` index and files it references
-- Any `.claude/*.md` or `.claude/memory/*.md` files
+- Configuration files (`CLAUDE.md`, `.cursor/rules`, `AGENTS.md`, or equivalent)
+- Any memory index files and the files they reference
+- Any per-session or per-project memory files
 
 For each file, note:
 
@@ -66,18 +66,6 @@ For each memory file:
    Remove or correct entries that no longer reflect reality
 3. **Add missing learnings** — write new entries for anything found in Phase 2
 
-Memory entry format (for MEMORY.md-style systems):
-
-```markdown
----
-name: short-name
-description: one-line description of what this memory is about
-type: feedback | user | project | reference
----
-
-The memory content. For feedback/project: include **Why:** and **How to apply:** lines.
-```
-
 ## Phase 4: Prune
 
 Remove entries with low future value:
@@ -88,7 +76,7 @@ Remove entries with low future value:
 - In-progress work that has since completed
 - Exact duplicates of entries in other files
 
-For MEMORY.md index files: remove pointers to files that no longer exist.
+For index files: remove pointers to files that no longer exist.
 
 ## After completing all phases
 
