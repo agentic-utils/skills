@@ -41,10 +41,7 @@ Create `plugins/<plugin-name>/skills/<skill-name>.md`:
 ```yaml
 ---
 name: skill-name
-description: Trigger-oriented description of when this skill should be used.
-metadata:
-  trigger: Specific phrases that should load this skill
-  author: agentic-utils
+description: What this skill does and when to use it. Include specific trigger phrases here — this is the only field agents use for skill selection.
 ---
 ```
 
