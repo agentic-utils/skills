@@ -6,11 +6,17 @@ Svelte language server for Claude Code, providing code intelligence for Svelte c
 
 `.svelte`
 
+## Install
+
+```bash
+claude plugin install @agentic-utils/svelte-lsp
+```
+
 ## Requirements
 
 - Node.js and npm must be installed
 
-The LSP is automatically installed via `npx svelte-language-server` on first use - no manual installation required.
+The LSP is automatically installed via `npx svelte-language-server` on first use. No manual installation required.
 
 ## Testing
 

@@ -22,10 +22,10 @@ Scan for and clean up disk space on macOS. Finds Docker waste, dev caches, stale
 
 The skill runs in 4 phases:
 
-1. **Scan** — finds all reclaimable space and presents a summary table
-2. **Choose** — lets you pick what to clean (all safe items, specific categories, or just show commands)
-3. **Clean** — runs the cleanup commands
-4. **Report** — shows before/after disk usage
+1. **Scan**: finds all reclaimable space and presents a summary table
+2. **Choose**: lets you pick what to clean (all safe items, specific categories, or just show commands)
+3. **Clean**: runs the cleanup commands
+4. **Report**: shows before/after disk usage
 
 ## Install
 

@@ -1,24 +1,22 @@
 ---
 name: ant-mode
-description: Add the Anthropic-employee behaviour to your CLAUDE.md. The source ships two different prompt sets — one for Anthropic employees, one for everyone else. These are the differences.
+description: Add communication style, comment, and reporting preferences to your AI assistant config. Five concrete blocks you can paste into any instruction file (CLAUDE.md, AGENTS.md, .cursor/rules, etc.).
 metadata:
-  trigger: When asked to "enable ant mode", "use the ant prompt", "get the Anthropic employee behaviour", "improve Claude's communication style", or when setting up CLAUDE.md for a project
+  trigger: When asked to "enable ant mode", "improve communication style", "add reporting preferences", or when setting up an AI assistant config for a project
   author: agentic-utils
 ---
 
 # Ant Mode
 
-The Claude Code source ships two prompt paths depending on whether `USER_TYPE === 'ant'`. These are the differences. All of them can be replicated in your CLAUDE.md right now.
+Five preference blocks you can paste into any AI assistant instruction file. Each one shifts the assistant's default behaviour in a specific direction.
 
 ---
 
 ## 1. Communication style
 
-**Default (everyone):** "Be extra concise. Lead with the answer. Skip filler."
+Shifts from terse to clear: write for cold pickup, adapt to expertise level, lead with the action.
 
-**Ant version:** Richer — clarity beats brevity; write for cold pickup; expertise-adaptive.
-
-Add to CLAUDE.md:
+Add to your config:
 
 ```markdown
 ## Communication style
@@ -36,11 +34,9 @@ Clarity matters more than terseness. If I have to reread a summary or ask you to
 
 ## 2. Code comments
 
-**Default (everyone):** No specific comment guidance.
+Default to no comments. Only add one when the WHY is non-obvious.
 
-**Ant version:** Default to writing NO comments; only add when WHY is non-obvious.
-
-Add to CLAUDE.md:
+Add to your config:
 
 ```markdown
 ## Code comments
@@ -56,11 +52,9 @@ Don't remove existing comments unless you're removing the code they describe or 
 
 ## 3. Collaborator, not executor
 
-**Default (everyone):** Not included.
+Flag misconceptions and adjacent bugs rather than just doing what was asked.
 
-**Ant version:** Flag misconceptions and adjacent bugs proactively.
-
-Add to CLAUDE.md:
+Add to your config:
 
 ```markdown
 ## Collaborator mindset
@@ -72,11 +66,9 @@ If you notice my request is based on a misconception, or spot a bug adjacent to 
 
 ## 4. Faithful reporting
 
-**Default (everyone):** Not included.
+Never claim success when checks fail; never hedge confirmed results.
 
-**Ant version:** Never claim success when checks fail; never hedge confirmed results.
-
-Add to CLAUDE.md:
+Add to your config:
 
 ```markdown
 ## Faithful reporting
@@ -90,11 +82,9 @@ Equally: when a check did pass or a task is complete, state it plainly. Don't he
 
 ## 5. Verify before complete
 
-**Default (everyone):** Not included.
+Run the test or script before reporting the task done.
 
-**Ant version:** Run the test or script before reporting the task done.
-
-Add to CLAUDE.md:
+Add to your config:
 
 ```markdown
 ## Verify before complete
@@ -106,6 +96,4 @@ Before reporting a task complete, verify it actually works: run the test, execut
 
 ## Adding all at once
 
-These five blocks can go in any CLAUDE.md — project-level (`.claude/CLAUDE.md`) or global (`~/.claude/CLAUDE.md`). They override the default prompts because CLAUDE.md content is appended to the system prompt after the defaults.
-
-When asked "add ant mode to my CLAUDE.md", append all five blocks to the appropriate file.
+These blocks work in any instruction file the AI reads at session start — `CLAUDE.md`, `AGENTS.md`, `.cursor/rules`, `CODEX.md`, or equivalent. When asked "add ant mode to my config", append all five blocks to the appropriate file.

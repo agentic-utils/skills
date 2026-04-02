@@ -1,31 +1,30 @@
 ---
 name: memory-writer
-description: Write effective CLAUDE.md and memory file entries. Covers what gets selected, why staleness matters, how the description field drives relevance scoring, and what format makes entries actionable.
+description: Write effective memory file entries. Covers what makes entries get loaded, why staleness matters, how to write descriptions that score well for relevance, and what format makes entries actionable.
 metadata:
-  trigger: When asked to "write a memory", "add to CLAUDE.md", "update my memory files", "how should I write this memory", or when creating new CLAUDE.md entries for a project
+  trigger: When asked to "write a memory", "add to memory", "update my memory files", "how should I write this memory", or when creating new entries for a project config file
   author: agentic-utils
 ---
 
 # Memory Writer
 
-How to write memory entries that get selected, stay fresh, and give Claude enough context to act.
+How to write memory entries that get loaded, stay fresh, and give the AI enough context to act.
 
-## How memory selection works
+## What makes a good description
 
-At the start of each session, Claude Code runs a selection pass over your memory files. Up to 5 files are loaded. The selection uses the `description` field in each file's frontmatter to score relevance against the current task.
+Most AI assistants with memory systems use the `description` field to decide which files to load for a given task. Treat it as the answer to "when should this file load?"
 
-This means:
+Good: `"When writing bash scripts or debugging exit code errors in this repo"`
+Bad: `"Bash notes"`
 
-- The `description` field is the most important thing you write — it determines whether the file loads at all
-- Files with vague descriptions ("general notes") lose to files with specific ones ("how to run migrations in this repo")
-- Files older than 1 day get a staleness warning injected into the session — stale files still load but are flagged
-- API documentation for tools currently in use is excluded automatically — don't store tool docs in memory files
+Good: `"When the user asks about database migrations in this project"`
+Bad: `"Work workflow"`
 
-## The MEMORY.md index
+Vague descriptions lose to specific ones. If the description could apply to any project, it is not specific enough.
 
-`MEMORY.md` is always loaded regardless of the 5-file limit. It's an index, not a place for memory content. Keep it short: the first 200 lines are loaded, the rest are truncated.
+## Memory index files
 
-Each entry is one line, under ~150 characters:
+If your tool uses an index file (e.g. `MEMORY.md`) to track memory files, keep it short and scannable. Each entry should be one line:
 
 ```markdown
 - [Short Title](file.md) — specific hook: what this memory is about and when it matters
@@ -34,7 +33,7 @@ Each entry is one line, under ~150 characters:
 Good:
 
 ```markdown
-- [DB Migration Pattern](db-migrations.md) — always run `two db reset --upgrade` after switching worktrees
+- [DB Migration Pattern](db-migrations.md) — always run reset after switching worktrees
 ```
 
 Bad:
@@ -43,25 +42,19 @@ Bad:
 - [Notes](notes.md) — various notes about the project
 ```
 
-## File frontmatter
+## File format
 
-Every memory file needs:
+A common memory file format uses frontmatter for metadata and markdown for content:
 
 ```markdown
 ---
 name: short-kebab-name
-description: one-line description — THIS is what the selection algorithm reads to score relevance
+description: one-line description — used to decide relevance
 type: feedback | user | project | reference
 ---
+
+The memory content.
 ```
-
-**Write the description as if answering "when should this file load?"**
-
-Good: `"When writing bash scripts or debugging exit code errors in this repo"`  
-Bad: `"Bash notes"`
-
-Good: `"When the user asks about Linear tickets or git commits at Two"`  
-Bad: `"Work workflow"`
 
 ## Memory types and their formats
 
@@ -105,7 +98,7 @@ Oncall latency dashboard at grafana.internal/d/api-latency — check when editin
 
 ## What makes entries actionable
 
-Include the **Why** and **How to apply** lines — not just what to do but when and why. Future sessions often face edge cases where the rule isn't obviously applicable; context lets you judge rather than blindly follow.
+Include **Why** and **How to apply** lines — not just what to do but when and why. Future sessions often face edge cases where the rule is not obviously applicable; context lets you judge rather than blindly follow.
 
 Before saving, ask:
 
@@ -116,19 +109,11 @@ Before saving, ask:
 ## What not to save
 
 - Code patterns and conventions — read the code
-- Git history, recent changes — `git log` is authoritative  
+- Git history, recent changes — `git log` is authoritative
 - Debugging sessions where the fix is now in the code — the commit message has the context
 - In-progress work or current session state — ephemeral
-- Things already in CLAUDE.md
-
-## Global vs project-specific
-
-`~/.claude/memory/` — global, loads in every project. Use for preferences, communication style, cross-project workflows.
-
-`.claude/memory/` — project-specific. Use for project constraints, decisions, patterns unique to this codebase.
-
-When in doubt, prefer project-specific. Global memory accumulates quickly and lowers selection quality across all projects.
+- Things already in your project config file
 
 ## Keeping memory fresh
 
-Staleness degrades quality faster than you expect. Set a reminder to run `dream` after completing a major project phase — it prunes outdated entries and prevents the 1-day staleness warning from polluting sessions with noise.
+Stale memory is worse than no memory — the AI may confidently cite things that no longer exist. Run `dream` periodically to prune outdated entries and keep memory files reflecting current reality.

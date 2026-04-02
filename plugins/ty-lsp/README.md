@@ -6,11 +6,17 @@ Python language server (ty) for Claude Code, providing static type checking and 
 
 `.py`, `.pyi`
 
+## Install
+
+```bash
+claude plugin install @agentic-utils/ty-lsp
+```
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) must be installed
 
-The LSP is automatically installed via `uvx ty@latest server` on first use - no manual installation required.
+The LSP is automatically installed via `uvx ty@latest server` on first use. No manual installation required.
 
 ## Notes
 
