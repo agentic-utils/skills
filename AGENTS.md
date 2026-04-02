@@ -18,7 +18,7 @@ plugins/
 ## Creating a Plugin
 
 1. Create `plugins/<plugin-name>/plugin.json`
-2. Add an entry in `.claude-plugin/marketplace.json`
+2. Add an entry in `.claude-plugin/marketplace.json` (required — plugin will not appear in the marketplace otherwise)
 3. Add skills under `plugins/<plugin-name>/skills/`
 4. Write a `README.md` (required — see below)
 5. Update the root `README.md` table
