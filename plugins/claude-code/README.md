@@ -22,8 +22,8 @@ claude plugin install @agentic-utils/claude-code
 
 These skills are grounded in findings from the Claude Code source leak. Details in [What we can all learn from the Claude Code source](https://brtkwr.com/posts/2026-04-01-what-we-can-all-learn-from-the-claude-code-source/).
 
-[`dream`]: skills/dream.md
-[`memory-writer`]: skills/memory-writer.md
-[`compaction-prep`]: skills/compaction-prep.md
-[`bash-safety`]: skills/bash-safety.md
-[`ant-mode`]: skills/ant-mode.md
+[`dream`]: skills/dream/SKILL.md
+[`memory-writer`]: skills/memory-writer/SKILL.md
+[`compaction-prep`]: skills/compaction-prep/SKILL.md
+[`bash-safety`]: skills/bash-safety/SKILL.md
+[`ant-mode`]: skills/ant-mode/SKILL.md
