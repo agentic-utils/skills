@@ -1,6 +1,6 @@
 ---
 name: ant-mode
-description: Add communication style, comment, and reporting preferences to your AI assistant config. Five concrete blocks you can paste into any instruction file (CLAUDE.md, AGENTS.md, .cursor/rules, etc.).
+description: Add communication style, comment, and reporting preferences to any AI assistant config. Use when asked to "enable ant mode", "improve communication style", "add reporting preferences", or when setting up a new AI assistant config.
 metadata:
   trigger: When asked to "enable ant mode", "improve communication style", "add reporting preferences", or when setting up an AI assistant config for a project
   author: agentic-utils

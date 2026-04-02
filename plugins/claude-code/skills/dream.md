@@ -1,6 +1,6 @@
 ---
 name: dream
-description: Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm. Removes stale entries, merges duplicates, and surfaces missing learnings from recent work.
+description: Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm. Use when asked to "dream", "consolidate memory", "clean up memory", or when memory files have grown stale or bloated.
 metadata:
   trigger: When asked to "dream", "consolidate memory", "clean up memory", "tidy up memory", or when memory files have grown stale or bloated
   author: agentic-utils

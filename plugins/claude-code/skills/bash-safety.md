@@ -1,6 +1,6 @@
 ---
 name: bash-safety
-description: Review bash commands for dangerous patterns and interpret exit codes correctly. Based on the exact heuristics and exit code semantics Claude Code uses internally.
+description: Review bash commands for dangerous patterns and interpret exit codes correctly. Use when asked to "check this bash", "is this safe to run", "review this script", or when debugging a script that fails unexpectedly.
 metadata:
   trigger: When asked to "check this bash", "is this safe to run", "review this script", or when debugging a script that's failing unexpectedly
   author: agentic-utils

@@ -1,6 +1,6 @@
 ---
 name: memory-writer
-description: Write effective memory file entries. Covers what makes entries get loaded, why staleness matters, how to write descriptions that score well for relevance, and what format makes entries actionable.
+description: Write effective memory file entries. Use when asked to "write a memory", "add to memory", "update my memory files", or when creating new entries for a project config file.
 metadata:
   trigger: When asked to "write a memory", "add to memory", "update my memory files", "how should I write this memory", or when creating new entries for a project config file
   author: agentic-utils

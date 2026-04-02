@@ -1,6 +1,6 @@
 ---
 name: compaction-prep
-description: Checkpoint mid-task state before context limits hit. Writes a handoff note so the session resumes exactly where it left off after a context reset or new session.
+description: Checkpoint mid-task state before context limits hit. Use when asked to "prep for compaction", "checkpoint", "save state", or when context is getting long.
 metadata:
   trigger: When context is getting long, before a complex multi-step task, or when asked to "prep for compaction", "save state", "checkpoint", "context is filling up"
   author: agentic-utils
