@@ -43,6 +43,13 @@
       "version": "1.0.0",
       "source": "./plugins/disk-cleanup",
       "category": "utilities"
+    },
+    {
+      "name": "claude-code",
+      "description": "Skills grounded in Claude Code internals",
+      "version": "1.0.0",
+      "source": "./plugins/claude-code",
+      "category": "utilities"
     }
   ]
 }
