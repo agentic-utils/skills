@@ -47,7 +47,7 @@
     {
       "name": "claude-code",
       "description": "Skills grounded in Claude Code internals",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "source": "./plugins/claude-code",
       "category": "utilities"
     }
