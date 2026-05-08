@@ -1,69 +1,82 @@
 ---
 name: dream
-description: Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm. Use when asked to "dream", "consolidate memory", "clean up memory", or when memory files have grown stale or bloated.
+description: Consolidate and prune project auto-memory by mining recent session transcripts and existing memory files. Use when asked to "dream", "consolidate memory", "clean up memory", or after significant project work to capture learnings.
 ---
 
-# Dream
+# Dream: Memory Consolidation
 
-Consolidate and prune memory files on demand using a 4-phase process.
+A reflective pass over project auto-memory. Synthesise recent learnings into durable, well-organised memories so future sessions orient quickly.
+
+- **Memory directory**: `~/.claude/projects/<project>/memory/` — write here directly with the Write tool. Do NOT run `mkdir` or check existence; it already exists.
+- **Session transcripts**: `~/.claude/projects/<project>/*.jsonl` — large append-only logs. Grep narrowly with hypothesis-driven terms; never read whole files.
+- **Resolve `<project>`** by mapping the current working directory: `/Users/me/Code/foo/bar` → `-Users-me-Code-foo-bar`.
 
 ## When to run
 
 - Memory files have grown large with outdated or overlapping entries
 - A major project phase just completed and learnings should be captured
-- Memory references are pointing to things that no longer exist
+- Memory references point to things that no longer exist
 - Explicitly asked: "dream", "consolidate memory", "clean up memory"
 
-## Phase 1: Orient
+## Phase 1 — Orient
 
-Read every memory file relevant to this project. Look for:
+- `ls` the memory directory to see what already exists
+- Read `MEMORY.md` to understand the current index
+- Skim existing topic files so you improve them rather than creating duplicates
+- If `logs/` or `sessions/` subdirectories exist (assistant-mode layout), review recent entries there
+- `git log --oneline -20` for recent project activity to anchor what's changed
 
-- Configuration files (`CLAUDE.md`, `.cursor/rules`, `AGENTS.md`, or equivalent)
-- Any memory index files and the files they reference
-- Any per-session or per-project memory files
+For each existing memory file, note:
 
-For each file, note:
-
-- When it was last modified (`stat <file>`)
-- How many entries it has
+- Last modified time (`stat <file>`)
 - Entries older than 7 days with no recent reinforcement
 - Duplicate or near-duplicate information across files
 
 Do not make changes yet. Build a picture of what exists.
 
-## Phase 2: Gather
+## Phase 2 — Gather recent signal
 
-Identify concrete learnings from recent work not yet captured in memory:
+Look for new information worth persisting. Sources in rough priority order:
 
-- Commands or patterns discovered this session
-- Decisions made and the reasoning behind them
-- Gotchas encountered (surprising failures, non-obvious behaviours)
-- File paths, function names, or configurations that came up repeatedly
-
-Check git log for recent commits:
-
-```bash
-git log --oneline -20 2>/dev/null
-```
-
-Flag anything worth adding that is currently missing.
-
-## Phase 3: Consolidate
-
-For each memory file:
-
-1. **Merge overlapping entries** — if two entries say the same thing differently, keep the more specific one
-2. **Update stale entries** — if an entry refers to a file, function, or config that no longer exists, verify it:
+1. **Daily logs** (`logs/YYYY/MM/YYYY-MM-DD.md`) if present — the append-only stream from a paired auto-memory writer.
+2. **Existing memories that drifted** — facts that contradict something visible in the codebase now. Verify with `ls`/`grep` before correcting.
+3. **Transcript search** — narrow, hypothesis-driven greps for things you already suspect matter:
 
    ```bash
-   ls <path> 2>/dev/null && echo EXISTS || echo MISSING
-   grep -r "functionName" --include="*.ts" --include="*.py" -l 2>/dev/null | head -5
+   grep -rn "<narrow term>" ~/.claude/projects/<project>/ --include="*.jsonl" | tail -50
    ```
 
-   Remove or correct entries that no longer reflect reality
-3. **Add missing learnings** — write new entries for anything found in Phase 2
+   Patterns worth grepping for across recent sessions:
+   - **User corrections**: `"don't"`, `"stop doing"`, `"never"`, `"why did you"`, `"you should have"` — strong feedback signals
+   - **Reinforced patterns**: same command/path/decision appearing across multiple sessions
+   - **Surprising failures**: `"argh"`, `"wtf"`, `"still failing"` — gotchas worth capturing
+   - **Validated approaches**: `"perfect"`, `"keep doing that"`, `"exactly"` — confirmations of non-obvious choices
+   - **Non-obvious gotchas**: things the user explained that aren't documented in the code
+4. **This session's learnings** — if invoked mid-conversation, capture decisions, gotchas, or process feedback from the current turn.
 
-## Phase 4: Prune
+Don't exhaustively read transcripts. Only chase specific hypotheses. Prefer `tail -50` over unbounded grep output. Flag anything worth adding that is currently missing.
+
+## Phase 3 — Consolidate
+
+For each thing worth remembering, write or update a memory file at the top level of the memory directory. Use the memory file format and type conventions from the auto-memory section of the system prompt — that's the source of truth for what to save, how to structure it, and what NOT to save.
+
+Focus on:
+
+- **Merge** new signal into existing topic files rather than creating near-duplicates. If two entries say the same thing differently, keep the more specific one.
+- **Convert relative dates** ("yesterday", "last week", "Thursday") to absolute dates so memories remain interpretable later.
+- **Delete contradicted facts at the source** — if today's investigation disproves an old memory, fix the file, don't just add a contradicting note alongside.
+- **Score before promoting**: a single one-off observation is rarely worth a memory. Prefer signals reinforced across sessions, or stated explicitly by the user as a standing rule.
+- **Counterfactual check**: before writing a feedback memory, ask "would this rule have helped in past sessions where it should have applied?" If no, it's probably too narrow to keep.
+
+## Phase 4 — Prune and index
+
+Update `MEMORY.md` so it stays under 200 lines. It's an **index**, not a dump — link to memory files with one-line descriptions. Never write memory content directly into it.
+
+- Remove pointers to memories that are now stale, wrong, or superseded
+- Demote verbose entries: keep the gist in the index, move the detail into the topic file
+- Add pointers to newly important memories
+- Resolve contradictions — if two files disagree, fix the wrong one
+- For broken pointers: remove them, don't leave them with a "TODO" annotation
 
 Remove entries with low future value:
 
@@ -73,15 +86,24 @@ Remove entries with low future value:
 - In-progress work that has since completed
 - Exact duplicates of entries in other files
 
-For index files: remove pointers to files that no longer exist.
+## Verification before deleting
 
-## After completing all phases
+If a memory cites a specific path, function, flag, or command, verify it before pruning:
 
-Report:
+```bash
+ls <path> 2>/dev/null && echo EXISTS || echo MISSING
+grep -rn "functionName" --include="*.py" --include="*.ts" -l 2>/dev/null | head -5
+```
+
+Memory drift is real, but so is deleting a memory that encodes a constraint not visible in the current diff. When in doubt, leave it.
+
+## Report
+
+Return a brief summary of what was consolidated, updated, or pruned:
 
 - Files reviewed
 - Entries added / updated / removed
 - Any references that could not be verified
 - Whether each memory file still accurately reflects current state
 
-Do not delete memory files entirely — only prune entries within them.
+If nothing changed (memories already tight), say so plainly. Don't pad. Do not delete memory files entirely — only prune entries within them.
