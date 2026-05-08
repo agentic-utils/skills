@@ -6,20 +6,23 @@ This repo is a Claude Code plugin marketplace. Each plugin lives under `plugins/
 
 ```text
 .claude-plugin/
-  marketplace.json        # Marketplace manifest — lists all plugins
+  marketplace.json              # Marketplace manifest — lists all plugins
 plugins/
   <plugin-name>/
-    plugin.json           # Plugin metadata
-    README.md             # Required — describes the plugin and its skills
+    plugin.json                 # Plugin metadata (includes version)
+    README.md                   # Required — describes the plugin and its skills
     skills/
-      <skill-name>.md     # One file per skill
+      <skill-name>/
+        SKILL.md                # One directory per skill, with SKILL.md inside
 ```
+
+**Important:** the plugin loader only picks up skills in the `skills/<name>/SKILL.md` directory format. Flat `skills/<name>.md` files are ignored.
 
 ## Creating a Plugin
 
 1. Create `plugins/<plugin-name>/plugin.json`
 2. Add an entry in `.claude-plugin/marketplace.json` (required — plugin will not appear in the marketplace otherwise)
-3. Add skills under `plugins/<plugin-name>/skills/`
+3. Add skills under `plugins/<plugin-name>/skills/<skill-name>/SKILL.md`
 4. Write a `README.md` (required — see below)
 5. Update the root `README.md` table
 
@@ -36,7 +39,7 @@ Use `plugins/claude-code/README.md` as a reference.
 
 ## Creating a Skill
 
-Create `plugins/<plugin-name>/skills/<skill-name>.md`:
+Create `plugins/<plugin-name>/skills/<skill-name>/SKILL.md`:
 
 ```yaml
 ---
@@ -77,7 +80,34 @@ Do **not** bump for:
 - **Minor** (`1.0.0` → `1.1.0`) — new skill added to the plugin, or meaningful new capability in an existing skill
 - **Major** (`1.0.0` → `2.0.0`) — breaking change (skill renamed, trigger phrases removed, process changed in a way that invalidates cached expectations)
 
-Also bump the version in `.claude-plugin/marketplace.json` to match.
+### Publishing checklist
+
+A version is **not published** until both files agree and the change is on `origin/main`. Claude Code reads `.claude-plugin/marketplace.json` to decide whether to refresh the cache — if only `plugin.json` is bumped, users will see the old skill forever.
+
+For every release, in the same commit:
+
+1. Bump `plugins/<plugin-name>/plugin.json` → `version`
+2. Bump `.claude-plugin/marketplace.json` → matching plugin entry's `version` (must match `plugin.json` exactly)
+3. Commit with a message describing the user-visible change
+4. Push to `origin/main`
+
+Verify after pushing:
+
+```bash
+# both should print the same version
+jq -r '.version' plugins/<plugin-name>/plugin.json
+jq -r ".plugins[] | select(.name==\"<plugin-name>\") | .version" .claude-plugin/marketplace.json
+```
+
+Users then refresh with:
+
+```text
+/plugin marketplace update agentic-utils
+/plugin install @agentic-utils/<plugin-name>
+/reload-plugins
+```
+
+**Common mistake:** bumping only `plugin.json`. The cache key is the marketplace version — `/plugin install` will report "not found" or silently no-op when the marketplace version is unchanged, even if `plugin.json` has moved on.
 
 ## Formatting
 
