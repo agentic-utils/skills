@@ -41,6 +41,9 @@ for d in ~/Library/Caches/*/; do du -sh "$d" 2>/dev/null; done | sort -hr | awk 
 # iOS/Xcode simulators
 du -sh ~/Library/Developer/CoreSimulator ~/Library/Developer/XCPGDevices 2>/dev/null
 
+# fnm shims — one dir per shell ever opened, never pruned (count clutter, ~0 bytes)
+ls -1 ~/.local/state/fnm_multishells 2>/dev/null | wc -l
+
 # Homebrew stale packages
 brew cleanup --dry-run 2>/dev/null | tail -5
 
@@ -76,6 +79,7 @@ Risk levels:
 - **Safe** — caches that are automatically rebuilt (npm, pip, poetry, go, brew, yarn)
 - **Safe** — Docker build cache, dangling images, unused volumes
 - **Safe** — Python .venvs (recreatable with `uv sync`, `poetry install`, or `pip install`)
+- **Safe** — fnm shims for dead PIDs (frees no disk; flag it when the count exceeds ~1000)
 - **Safe** — orphaned app data (only if the application is no longer installed)
 - **Check** — git worktrees (may have uncommitted changes)
 - **Check** — Application Support dirs (may contain user data)
@@ -137,6 +141,24 @@ Remove the large app cache directories identified in the scan.
 - Browser caches require the browser to be closed first
 - Skip any caches the user wants to keep
 - Use `rm -rf ~/Library/Caches/<dirname>` for each selected cache
+
+#### fnm shims
+
+fnm creates `~/.local/state/fnm_multishells/<pid>_<timestamp>` per shell and never prunes it.
+Removing them frees no disk, since they are symlinks, but the count grows without bound. Keep
+any shim whose PID is still running, or that shell loses `node`:
+
+```bash
+cd ~/.local/state/fnm_multishells || exit 1
+ps -A -o pid= | tr -d ' ' | sort -u > /tmp/live_pids.txt
+ls -1 > /tmp/all_shims.txt
+awk -F_ 'NR==FNR{live[$0];next} !($1 in live){print}' /tmp/live_pids.txt /tmp/all_shims.txt \
+  | tr '\n' '\0' | xargs -0 -n 200 rm -rf
+```
+
+Run the `ps` and the `rm` in the same invocation — a shell that exits between them shifts the
+live set. Use shell `rm -rf` rather than Python's `shutil.rmtree`, which fails on every entry
+here with a null errno. Verify afterwards with `fnm current` and `node -v`.
 
 #### iOS/Xcode simulators
 
