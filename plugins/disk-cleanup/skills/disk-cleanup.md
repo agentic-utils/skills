@@ -54,8 +54,12 @@ for app_dir in ~/.lmstudio ~/.ollama ~/.cursor ~/.windsurf ~/.vscode ~/.vscode-i
   [ -d "$app_dir" ] || continue
   du -sh "$app_dir" 2>/dev/null
 done
-# Application Support: flag large dirs (>500MB) for review
+# Application Support: flag large dirs (>500MB) for review.
+# Agent data (Claude, Codex, OpenAI) is never a cleanup candidate — it holds
+# conversation history, so filter it out here rather than relying on the
+# deletion-step rule to catch it.
 for d in ~/Library/Application\ Support/*/; do
+  case "$(basename "$d")" in Claude|Codex|OpenAI|*.anthropic.*|*openai*) continue ;; esac
   du -sh "$d" 2>/dev/null
 done | sort -hr | awk -F'\t' '{size=$1; if (size ~ /[0-9.]+G/ || (size ~ /[0-9.]+M/ && size+0 > 500)) print}' | head -10
 ```
@@ -163,3 +167,4 @@ Show before/after disk usage with `df -h /` and a summary of space freed per cat
 - **Always show** what will be deleted and the size before running destructive commands
 - All deleted items should be recreatable (caches, build artifacts, venvs)
 - Only remove orphaned app data when the application is confirmed to be uninstalled
+- **Never surface** Claude, Codex or OpenAI data in scan output — filter it out so it is never offered as a candidate, rather than relying on the user to decline it
