@@ -40,7 +40,7 @@
     {
       "name": "disk-cleanup",
       "description": "Scan for and clean up disk space on macOS",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "source": "./plugins/disk-cleanup",
       "category": "utilities"
     },
