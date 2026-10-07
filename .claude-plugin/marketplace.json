@@ -5,9 +5,9 @@
   },
   "plugins": [
     {
-      "name": "ty-lsp",
+      "name": "agentic-utils-ty-lsp",
       "description": "Python language server (ty) for Claude Code",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "./plugins/ty-lsp",
       "category": "development",
       "lspServers": {
@@ -22,9 +22,9 @@
       }
     },
     {
-      "name": "svelte-lsp",
+      "name": "agentic-utils-svelte-lsp",
       "description": "Svelte language server for Claude Code",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "./plugins/svelte-lsp",
       "category": "development",
       "lspServers": {
@@ -38,16 +38,16 @@
       }
     },
     {
-      "name": "disk-cleanup",
+      "name": "agentic-utils-disk-cleanup",
       "description": "Scan for and clean up disk space on macOS",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "source": "./plugins/disk-cleanup",
       "category": "utilities"
     },
     {
-      "name": "claude-code",
+      "name": "agentic-utils-claude-code",
       "description": "Skills grounded in Claude Code internals",
-      "version": "1.0.3",
+      "version": "1.1.0",
       "source": "./plugins/claude-code",
       "category": "utilities"
     }

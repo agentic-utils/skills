@@ -1,6 +1,6 @@
 {
-  "name": "ty-lsp",
-  "version": "1.0.0",
+  "name": "agentic-utils-ty-lsp",
+  "version": "1.1.0",
   "description": "Python type checker (ty) from Astral for Claude Code",
   "author": {
     "name": "agentic-utils"

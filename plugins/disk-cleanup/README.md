@@ -30,5 +30,5 @@ The skill runs in 4 phases:
 ## Install
 
 ```bash
-claude plugin install @agentic-utils/disk-cleanup
+claude plugin install @agentic-utils/agentic-utils-disk-cleanup
 ```
