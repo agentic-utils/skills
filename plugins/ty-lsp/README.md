@@ -9,7 +9,7 @@ Python language server (ty) for Claude Code, providing static type checking and 
 ## Install
 
 ```bash
-claude plugin install @agentic-utils/ty-lsp
+claude plugin install @agentic-utils/agentic-utils-ty-lsp
 ```
 
 ## Requirements

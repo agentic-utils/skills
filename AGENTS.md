@@ -20,7 +20,7 @@ plugins/
 
 ## Creating a Plugin
 
-1. Create `plugins/<plugin-name>/plugin.json`
+1. Create `plugins/<plugin-name>/plugin.json` with `"name": "agentic-utils-<plugin-name>"`, so skills show as `/agentic-utils-<plugin-name>:<skill>` and their source is obvious
 2. Add an entry in `.claude-plugin/marketplace.json` (required — plugin will not appear in the marketplace otherwise)
 3. Add skills under `plugins/<plugin-name>/skills/<skill-name>/SKILL.md`
 4. Write a `README.md` (required — see below)
@@ -103,7 +103,7 @@ Users then refresh with:
 
 ```text
 /plugin marketplace update agentic-utils
-/plugin install @agentic-utils/<plugin-name>
+/plugin install @agentic-utils/agentic-utils-<plugin-name>
 /reload-plugins
 ```
 

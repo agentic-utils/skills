@@ -9,7 +9,7 @@ Svelte language server for Claude Code, providing code intelligence for Svelte c
 ## Install
 
 ```bash
-claude plugin install @agentic-utils/svelte-lsp
+claude plugin install @agentic-utils/agentic-utils-svelte-lsp
 ```
 
 ## Requirements

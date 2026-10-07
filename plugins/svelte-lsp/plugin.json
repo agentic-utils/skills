@@ -1,6 +1,6 @@
 {
-  "name": "svelte-lsp",
-  "version": "1.0.0",
+  "name": "agentic-utils-svelte-lsp",
+  "version": "1.1.0",
   "description": "Svelte language server for Claude Code",
   "author": {
     "name": "agentic-utils"

@@ -15,7 +15,7 @@ Five skills grounded in Claude Code's source code. Each one surfaces an internal
 ## Install
 
 ```bash
-claude plugin install @agentic-utils/claude-code
+claude plugin install @agentic-utils/agentic-utils-claude-code
 ```
 
 ## Background
