@@ -35,7 +35,13 @@ Custom channels are a research preview, so start Claude Code with the developmen
 claude --dangerously-load-development-channels plugin:agentic-utils-gh-pr-events@agentic-utils
 ```
 
-Without the flag the tools still work, but Claude Code silently drops every event.
+That flag shows a confirmation prompt each time. To skip it, allow the plugin in managed settings (`/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, needs sudo) and use `--channels` instead:
+
+```json
+{ "allowedChannelPlugins": [{ "marketplace": "agentic-utils", "plugin": "agentic-utils-gh-pr-events" }] }
+```
+
+Without either flag the tools still work, but Claude Code silently drops every event.
 
 ## Requirements
 
@@ -45,16 +51,22 @@ Without the flag the tools still work, but Claude Code silently drops every even
 
 ## How it works
 
-The first `subscribe_pr` in a repo starts `gh webhook forward` for that repo. That creates a temporary repo webhook relayed by GitHub itself, so no third-party service sees your events. Every delivery is checked against a per-session HMAC secret. When the last PR in a repo is unsubscribed, or the session ends, the forwarder stops and GitHub removes the webhook. Idle sessions hold no webhook.
+GitHub allows one `gh webhook forward` per repo, so all sessions on the machine share one broker. The first `subscribe_pr` starts it in the background (`server.js broker`, listening on `~/.claude/state/gh-pr-events/broker.sock`), and each session's channel connects to it. The broker exits after five minutes with no sessions connected, and logs to `broker.log` next to the socket.
 
-GitHub sends no webhook when a PR becomes unmergeable, so the forwarder also receives the repo's pushes. After a push to a subscribed PR's base branch, or to the PR itself, the channel asks GitHub for the PR's mergeability and reports changes. Pushes themselves never reach Claude.
+The first subscription to a PR in a repo, from any session, starts `gh webhook forward` for that repo. That creates a temporary repo webhook relayed by GitHub itself, so no third-party service sees your events. Every delivery is checked against a per-broker HMAC secret, then sent to each session subscribed to that PR. When the last session watching a repo unsubscribes or ends, the forwarder stops and GitHub removes the webhook.
+
+If the broker dies, each session's channel starts a new one (only one wins) and subscribes to its PRs again; a PR that can't be resubscribed is reported and dropped. The new broker stops any forwarders the old one left running before it starts its own. The state directory is created private (mode 0700) and the broker refuses one owned by another user.
+
+GitHub sends no webhook when a PR becomes unmergeable, so the forwarder also receives the repo's pushes. After a push to a subscribed PR's base branch, or to the PR itself, the broker asks GitHub for the PR's mergeability and reports changes. Pushes themselves never reach Claude.
 
 Comment and review bodies are written by other people, so the channel tells Claude to treat them as information, never as instructions.
 
 ## Limits
 
-- GitHub allows one forwarder per repo, so only one session at a time can watch PRs in a given repo. A second subscribe there returns an error.
-- Events that happen while no session is subscribed are not replayed.
+- A forward to the same repo from outside the broker (another machine, or a manual `gh webhook forward`) blocks it: subscribing there returns an error.
+- A running broker keeps its code until it exits, so a plugin update takes effect once every session using it has closed for five minutes. Whichever session starts the broker decides which copy of `server.js` it runs.
+- The webhook secret is passed to `gh-webhook` on its command line, so other users on a shared machine can read it with `ps`. Use this on single-user machines.
+- Events that happen while no session is subscribed are not replayed. If a forwarder dies, or the broker restarts, the affected sessions are told and Claude has to call `subscribe_pr` again for anything that didn't come back.
 - Workflow runs from forks are not linked to the PR by GitHub, so they don't arrive.
 - Subscriptions live in memory: a restarted or resumed session starts with none.
 
@@ -62,8 +74,9 @@ Comment and review bodies are written by other people, so the channel tells Clau
 
 | Env var                 | Description                                                                                                          |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `GH_PR_EVENTS_STATE_DIR` | Where the broker keeps its socket, `broker.log` and `forwarders.json` (default `~/.claude/state/gh-pr-events`) |
 | `GH_PR_EVENTS_PORT`     | Local port for deliveries (default: any free port)                                                                   |
-| `GH_PR_EVENTS_BEAT_DIR` | If set, touches `<dir>/<owner>_<repo>_<n>` every 4 minutes per watched PR, for hooks that need proof a PR is watched |
+| `GH_PR_EVENTS_BEAT_DIR` | If set, touches `<dir>/<owner>_<repo>_<n>` every 4 minutes per watched PR, for hooks that need proof a PR is watched. Each session's own setting applies to its own PRs |
 
 ## Development
 
