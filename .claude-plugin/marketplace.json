@@ -13,7 +13,10 @@
       "lspServers": {
         "ty": {
           "command": "uvx",
-          "args": ["ty@latest", "server"],
+          "args": [
+            "ty@latest",
+            "server"
+          ],
           "extensionToLanguage": {
             ".py": "python",
             ".pyi": "python"
@@ -30,7 +33,10 @@
       "lspServers": {
         "svelte": {
           "command": "npx",
-          "args": ["svelte-language-server", "--stdio"],
+          "args": [
+            "svelte-language-server",
+            "--stdio"
+          ],
           "extensionToLanguage": {
             ".svelte": "svelte"
           }
@@ -50,6 +56,13 @@
       "version": "1.1.0",
       "source": "./plugins/claude-code",
       "category": "utilities"
+    },
+    {
+      "name": "agentic-utils-gh-pr-events",
+      "description": "Push GitHub PR comments, reviews and CI results into the session",
+      "version": "1.0.0",
+      "source": "./plugins/gh-pr-events",
+      "category": "development"
     }
   ]
 }

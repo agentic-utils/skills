@@ -15,11 +15,13 @@ Then use `/plugin` to browse and install available plugins.
 | Plugin         | Description                                                    |
 | -------------- | -------------------------------------------------------------- |
 | [claude-code]  | Skills grounded in Claude Code internals                       |
+| [gh-pr-events] | Push GitHub PR comments, reviews and CI results into Claude    |
 | [disk-cleanup] | Scan for and clean up disk space on macOS (macOS only)         |
 | [ty-lsp]       | Python type checking via [ty](https://github.com/astral-sh/ty) |
 | [svelte-lsp]   | Svelte language server                                         |
 
 [claude-code]: plugins/claude-code/README.md
+[gh-pr-events]: plugins/gh-pr-events/README.md
 [disk-cleanup]: plugins/disk-cleanup/README.md
 [ty-lsp]: plugins/ty-lsp/README.md
 [svelte-lsp]: plugins/svelte-lsp/README.md

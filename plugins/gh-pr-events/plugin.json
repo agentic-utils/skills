@@ -1,0 +1,23 @@
+{
+  "name": "agentic-utils-gh-pr-events",
+  "version": "1.0.0",
+  "description": "Claude Code channel that pushes GitHub PR comments, reviews, state changes and CI results into the session for PRs Claude subscribes to",
+  "author": {
+    "name": "agentic-utils"
+  },
+  "keywords": [
+    "github",
+    "pull-request",
+    "ci",
+    "channel",
+    "webhook"
+  ],
+  "mcpServers": {
+    "gh-pr-events": {
+      "command": "bun",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server.js"
+      ]
+    }
+  }
+}

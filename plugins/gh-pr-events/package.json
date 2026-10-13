@@ -1,0 +1,12 @@
+{
+  "name": "gh-pr-events",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "bun build src/server.ts --target=bun --minify --outfile server.js",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}
