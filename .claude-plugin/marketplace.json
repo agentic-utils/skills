@@ -60,7 +60,7 @@
     {
       "name": "agentic-utils-gh-pr-events",
       "description": "Push GitHub PR comments, reviews and CI results into the session",
-      "version": "2.0.0",
+      "version": "2.0.1",
       "source": "./plugins/gh-pr-events",
       "category": "development"
     }

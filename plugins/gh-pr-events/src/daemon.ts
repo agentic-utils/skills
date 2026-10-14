@@ -3,7 +3,7 @@ import type { Subprocess } from 'bun'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
-import { version } from '../plugin.json'
+import { version } from '../.claude-plugin/plugin.json'
 import { beatName, parsePr, summarise, verified, type Event } from './events'
 import { alive, daemonFile, isDaemon, log, privateStateDir, proof, reachable, readJson, writeJson, type DaemonInfo } from './state'
 
