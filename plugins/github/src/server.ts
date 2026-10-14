@@ -10,8 +10,21 @@
 //
 // Invariant:
 // - each repo has at most one forwarder, running exactly while some live session (connected, or closed for less
-//   than the TTL) subscribes to a PR in it;
+//   than the TTL) subscribes to a PR in it; one that exits (as gh-webhook does whenever its connection drops) is
+//   restarted, and its subscriptions dropped only after 10 failed restarts in a row;
 // - a session gets every event for its PRs: live while connected, queued (up to 100) while not;
+// - a merged PR is unsubscribed at once; one closed without merging stays subscribed for the reopen window (24h)
+//   and is unsubscribed, its sessions told, if it isn't reopened in time;
+// - nothing is lost to a gap, while the machine slept (a 5s timer firing over 30s late), a forwarder was down, or no
+//   daemon ran: the gap opens at the last moment each PR had everything, and live events don't close it; once the
+//   forwarder is back, each PR is caught up from GitHub's API (issue events, comments, review comments, reviews,
+//   head moves, CI) from the gap's start, recovered events are marked as such, and a catch-up that keeps failing
+//   tells the PR's sessions and leaves the gap open; one that finishes after the PR fell behind again leaves the new
+//   gap open too. GitHub deletes a forwarder's webhook, delivery log included,
+//   as soon as its connection dies, so that log is no use;
+// - a catch-up never repeats an event already delivered (kept per PR in sessions.json, matched by id, or for a PR
+//   action by kind and time), and live events are never dropped as repeats of each other;
+// - once stop() begins, no forwarder is started, so none outlives the daemon;
 // - what a session is told it subscribes to matches the daemon's view (a subscription that dies is dropped, and the
 //   session is told);
 // - no forwarder or webhook outlives its last subscription, including across a daemon crash once the next one starts;
@@ -21,11 +34,14 @@
 // - the newest running version serves: a shim older than the newest recorded version waits for that version's
 //   daemon before starting its own, and gives up on it (a rollback) after about 10s.
 //
-// Env: GH_PR_EVENTS_STATE_DIR (daemon.json, sessions.json, daemon.log, forwarders.json, latest.json; default
-//      ~/.claude/state/gh-pr-events), GH_PR_EVENTS_PORT (daemon port, default: any free port),
+// Env (named after the plugin's old name, gh-pr-events, so existing settings keep working): GH_PR_EVENTS_STATE_DIR (daemon.json, sessions.json, daemon.log, forwarders.json, latest.json; default
+//      ~/.claude/state/pr-events), GH_PR_EVENTS_PORT (daemon port, default: any free port),
 //      GH_PR_EVENTS_SESSION_TTL_HOURS (forget a closed session after this long, default 72),
+//      GH_PR_EVENTS_REOPEN_HOURS (keep a PR closed without merging subscribed this long, default 24),
 //      GH_PR_EVENTS_BEAT_DIR - if set, touch <dir>/<owner>_<repo>_<n> every few minutes per watched PR
-//      (lets a Stop hook check a PR is still being watched), GH_PR_EVENTS_FORWARDER and GH_PR_EVENTS_GH (tests only: stand-ins for gh-webhook and gh).
+//      (lets a Stop hook check a PR is still being watched), GH_PR_EVENTS_FORWARDER and GH_PR_EVENTS_GH (tests only: stand-ins for gh-webhook and gh),
+//      GH_PR_EVENTS_GAP_MS and GH_PR_EVENTS_RETRY_MS (tests only: how late the 5s timer must fire to count as a
+//      sleep, default 30000; the wait between catch-up attempts, default 30000).
 import { startDaemon } from './daemon'
 import { shim } from './shim'
 import { log } from './state'
@@ -43,4 +59,5 @@ if (process.argv[2] === 'daemon') {
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(sig, () => quit(sig))
   process.on('uncaughtException', quit)
   process.on('unhandledRejection', quit)
+  log(`daemon ${process.pid} ready`) // state loaded and signals handled; tests wait for this line
 } else await shim()

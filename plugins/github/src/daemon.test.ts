@@ -10,20 +10,39 @@ import { proof } from './state'
 const server = `${import.meta.dir}/server.ts`
 const T = 45_000
 
-// Logs "start <pid> <args>" and "stop <pid>" to $FAKE_LOG; FAKE_FAIL=1 makes it die at once like a refused forward.
+// Logs "start <pid> <args>" and "stop <pid>" to $FAKE_LOG; FAKE_FAIL=1 makes it die at once like a refused forward,
+// FAKE_SLOW_EXIT=1 take 3s to exit when told to.
 const fakeForwarder = `#!/bin/bash
 if [ -n "$FAKE_FAIL" ]; then echo "fake: forward refused" >&2; exit 1; fi
 echo "start $$ $*" >> "$FAKE_LOG"
-trap 'kill $c 2>/dev/null; echo "stop $$" >> "$FAKE_LOG"; exit 0' INT TERM
+trap '[ -n "$FAKE_SLOW_EXIT" ] && sleep 3; kill $c 2>/dev/null; echo "stop $$" >> "$FAKE_LOG"; exit 0' INT TERM
 sleep 600 & c=$!
 wait $c
 `
-// The daemon asks gh for mergeability and compare status: answer "no conflict" and "ahead".
+// The daemon asks gh its version ($FAKE_GH_VERSION), mergeability (-q: "no conflict", head $FAKE_HEAD) and compare
+// status ("ahead"). Anything else is one page served from $FAKE_API/<path with / as _>, query dropped, or a 404:
+// page=N serves <file>@N, and -i names the last page from <file>@last. --slurp wraps the page as GitHub's one-page
+// result, unless FAKE_NO_SLURP makes it an unknown flag, like gh before 2.48. <file>.delay holds the call that many
+// seconds; with FAKE_GH_LOG set, each served call logs "done <path>" there.
 const fakeGh = `#!/bin/bash
-case "$2" in */compare/*) echo ahead ;; *) printf 'main\\ttrue\\n' ;; esac
+[ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
+for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+case "$path" in */compare/*) echo ahead; exit ;; esac
+case " $* " in *" -q "*) printf 'main\\ttrue\\t%s\\n' "$FAKE_HEAD"; exit ;; esac
+f="$FAKE_API/$(printf %s "\${path%%\\?*}" | tr / _)"
+page=$(printf '&%s' "\${path#*\\?}" | sed -n 's/.*&page=\\([0-9]*\\).*/\\1/p')
+[ -n "$page" ] && [ -f "$f@$page" ] && f="$f@$page"
+[ -f "$f" ] || exit 1
+[ -f "$f.delay" ] && sleep "$(cat "$f.delay")"
+[ -n "$FAKE_GH_LOG" ] && trap 'echo "done $path" >> "$FAKE_GH_LOG"' EXIT
+case " $* " in
+  *" --slurp "*) [ -n "$FAKE_NO_SLURP" ] && { echo 'unknown flag: --slurp' >&2; exit 1; }; printf '['; cat "$f"; printf ']' ;;
+  *" -i "*) printf 'HTTP/2.0 200 OK\\r\\n'; [ -f "$f@last" ] && printf 'Link: <https://api.github.com/x?per_page=100&page=%s>; rel="last"\\r\\n' "$(cat "$f@last")"; printf '\\r\\n'; cat "$f" ;;
+  *) cat "$f" ;;
+esac
 `
 
-type Env = { dir: string; env: Record<string, string> }
+type Env = { dir: string; env: Record<string, string>; api: string }
 const procs: Subprocess[] = []
 const dirs: string[] = []
 
@@ -47,10 +66,11 @@ async function until<T>(what: string, fn: () => T | Promise<T>, ms = 20_000): Pr
 }
 
 function setup(extra: Record<string, string> = {}): Env {
-  const root = mkdtempSync(`${tmpdir()}/gh-pr-events-test-`)
+  const root = mkdtempSync(`${tmpdir()}/pr-events-test-`)
   dirs.push(root)
   const dir = `${root}/state`
   mkdirSync(dir, { mode: 0o700 })
+  mkdirSync(`${root}/api`)
   writeFileSync(`${root}/fwd`, fakeForwarder)
   writeFileSync(`${root}/gh`, fakeGh)
   chmodSync(`${root}/fwd`, 0o755)
@@ -64,12 +84,13 @@ function setup(extra: Record<string, string> = {}): Env {
     GH_PR_EVENTS_FORWARDER: `${root}/fwd`,
     GH_PR_EVENTS_GH: `${root}/gh`,
     FAKE_LOG: `${root}/fwd.log`,
+    FAKE_API: `${root}/api`,
     ...extra,
   }
   delete (env as any).GH_PR_EVENTS_PORT
   delete (env as any).CLAUDE_CODE_SESSION_ID // the runner may itself be inside Claude Code
   delete (env as any).GH_PR_EVENTS_BEAT_DIR
-  return { dir, env }
+  return { dir, env, api: `${root}/api` }
 }
 
 // Forwarders by pid, with their args, from the fake's log.
@@ -94,8 +115,17 @@ function spawnDaemon(e: Env) {
 }
 
 type Daemon = { p: Subprocess; port: number; token: string; pid: number }
+// A daemon that won the election, once it says it's ready: daemon.json appears as soon as it's elected, before it
+// has loaded sessions.json or handles signals, so waiting on that alone races both.
 async function daemon(e: Env): Promise<Daemon> {
-  const p = spawnDaemon(e)
+  const p = Bun.spawn(['bun', server, 'daemon'], { env: e.env, stdout: 'ignore', stderr: 'pipe' })
+  procs.push(p)
+  let out = ''
+  ;(async () => {
+    const dec = new TextDecoder()
+    for await (const chunk of p.stderr) out += dec.decode(chunk, { stream: true }) // read to the end, so the pipe never fills
+  })().catch(() => {})
+  await until('daemon ready', () => out.includes(`daemon ${p.pid} ready`))
   const info = await until('daemon.json', () => {
     try {
       const d = JSON.parse(readFileSync(`${e.dir}/daemon.json`, 'utf8'))
@@ -141,25 +171,28 @@ function stream(d: Daemon, sid: string, headers: Record<string, string> = {}) {
   return { got, connected: () => connected, close: () => (ac.abort(), done) }
 }
 
+async function hook(d: Daemon, secret: string, event: string, payload: object) {
+  const body = JSON.stringify(payload)
+  const sig = 'sha256=' + createHmac('sha256', secret).update(body).digest('hex')
+  const r = await fetch(`http://127.0.0.1:${d.port}/webhook`, { method: 'POST', body, headers: { 'x-github-event': event, 'x-hub-signature-256': sig } })
+  expect(r.status).toBe(200)
+}
+
+// A PR comment as the API returns it; the webhook carries the same object.
+const apiComment = (id: number, created_at: string, pr = 'o/r#7') => {
+  const [repo, n] = pr.split('#')
+  return { id, user: { login: 'amy' }, html_url: `https://github.com/${repo}/pull/${n}#c${id}`, body: `hello ${id}`, created_at }
+}
+const commentHook = (d: Daemon, secret: string, c: ReturnType<typeof apiComment>, pr = 'o/r#7') => {
+  const [repo, n] = pr.split('#')
+  return hook(d, secret, 'issue_comment', { action: 'created', repository: { full_name: repo }, sender: c.user, issue: { number: Number(n), pull_request: {} }, comment: c })
+}
+
 let commentId = 0
 async function comment(d: Daemon, secret: string, pr = 'o/r#7') {
-  const [repo, n] = pr.split('#')
-  const id = ++commentId
-  const body = JSON.stringify({
-    action: 'created',
-    repository: { full_name: repo },
-    sender: { login: 'amy' },
-    issue: { number: Number(n), pull_request: {} },
-    comment: { html_url: `https://github.com/${repo}/pull/${n}#c${id}`, body: `hello ${id}` },
-  })
-  const sig = 'sha256=' + createHmac('sha256', secret).update(body).digest('hex')
-  const r = await fetch(`http://127.0.0.1:${d.port}/webhook`, {
-    method: 'POST',
-    body,
-    headers: { 'x-github-event': 'issue_comment', 'x-hub-signature-256': sig },
-  })
-  expect(r.status).toBe(200)
-  return `hello ${id}`
+  const c = apiComment(++commentId, new Date().toISOString(), pr)
+  await commentHook(d, secret, c, pr)
+  return c.body
 }
 
 afterEach(async () => {
@@ -173,7 +206,7 @@ afterEach(async () => {
       process.kill(pid, 'SIGTERM')
       await until('detached daemon to exit', () => !alive(pid), 30_000)
     } catch {}
-    const e = { env: { FAKE_LOG: `${dir}/fwd.log` } } as Env
+    const e = { env: { FAKE_LOG: `${dir}/fwd.log` } } as unknown as Env
     await until('forwarders to stop', () => running(e).length === 0, 15_000).catch(() => {
       for (const [pid] of running(e)) process.kill(pid, 'SIGKILL')
     })
@@ -366,7 +399,7 @@ test(
 
     send({ id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } })
     const init = await reply(1)
-    expect(init.result.serverInfo.name).toBe('gh-pr-events')
+    expect(init.result.serverInfo.name).toBe('pr-events')
     expect(init.result.capabilities.experimental).toEqual({ 'claude/channel': {} })
     expect(init.result.instructions).toContain('subscribe_pr')
     send({ method: 'notifications/initialized' })
@@ -463,16 +496,16 @@ test(
   'after an update the newest version serves at once, and an older shim waits for it rather than starting its own',
   async () => {
     const e = setup()
-    const root = mkdtempSync(`${tmpdir()}/gh-pr-events-test-`)
+    const root = mkdtempSync(`${tmpdir()}/pr-events-test-`)
     dirs.push(root)
-    cpSync(import.meta.dir, `${root}/gh-pr-events/src`, { recursive: true }) // the daemon check wants gh-pr-events in its path
+    cpSync(import.meta.dir, `${root}/agentic-utils-github/src`, { recursive: true }) // the daemon check wants agentic-utils-github in its path
     const meta = JSON.parse(readFileSync(`${import.meta.dir}/../.claude-plugin/plugin.json`, 'utf8'))
-    mkdirSync(`${root}/gh-pr-events/.claude-plugin`, { recursive: true })
-    writeFileSync(`${root}/gh-pr-events/.claude-plugin/plugin.json`, JSON.stringify({ ...meta, version: '99.0.0' }))
+    mkdirSync(`${root}/agentic-utils-github/.claude-plugin`, { recursive: true })
+    writeFileSync(`${root}/agentic-utils-github/.claude-plugin/plugin.json`, JSON.stringify({ ...meta, version: '99.0.0' }))
 
     const d1 = await daemon(e)
     const t0 = Date.now()
-    const s99 = shim(e, { CLAUDE_CODE_SESSION_ID: 'sess-new' }, `${root}/gh-pr-events/src/server.ts`)
+    const s99 = shim(e, { CLAUDE_CODE_SESSION_ID: 'sess-new' }, `${root}/agentic-utils-github/src/server.ts`)
     s99.begin()
     await until('99.0.0 serving', () => existsSync(`${e.dir}/daemon.json`) && daemonInfo(e).version === '99.0.0')
     expect(Date.now() - t0).toBeLessThan(4000) // replaced and started in one go, no waiting out a retry interval
@@ -689,7 +722,7 @@ test(
       await until('quarantine notice', () => first.got.length)
       await Bun.sleep(200)
       expect(first.got).toEqual([
-        { content: "gh-pr-events couldn't read its saved subscriptions; if this session had any, call subscribe_pr again", meta: { event: 'channel_error' } },
+        { content: "pr-events couldn't read its saved subscriptions; if this session had any, call subscribe_pr again", meta: { event: 'channel_error' } },
       ])
       await first.close()
     }
@@ -706,7 +739,7 @@ test(
     const [[, args]] = await up(e2) // the good entry's subscription resumed
     expect(args).toContain('--repo=o/r')
     expect(alive(d.pid)).toBe(true)
-    expect(Object.keys(JSON.parse(readFileSync(`${e2.dir}/sessions.json`, 'utf8')))).toEqual(['sess-ok'])
+    expect(Object.keys(JSON.parse(readFileSync(`${e2.dir}/sessions.json`, 'utf8')))).toEqual(['sess-ok', '#seen'])
   },
   T,
 )
@@ -742,8 +775,386 @@ test(
     const s = stream(d, 'sess-o')
     await until('all delivered', () => s.got.length === 102)
     expect(s.got[0].content).toBe('watching: o/r#7')
-    expect(s.got[1].content).toBe('5 older gh-pr-events notifications were dropped while this session was away')
+    expect(s.got[1].content).toBe('5 older pr-events notifications were dropped while this session was away')
     expect(s.got[101].content).toContain(last)
+    await s.close()
+  },
+  T,
+)
+
+// ---- catching up after a sleep or a dead forwarder ----
+
+const serve = (e: Env, path: string, value: unknown) => writeFileSync(`${e.api}/${path.replace(/\//g, '_')}`, JSON.stringify(value))
+const body = (g: { content: string }) => g.content.replace(/^[\w.-]+\/[\w.-]+#\d+: /, '') // without the PR name
+const recovered = (s: { got: { content: string }[] }) => s.got.filter(g => body(g).startsWith('(recovered after a gap) '))
+const errors = (s: { got: { meta: Record<string, string> }[] }) => s.got.filter(g => g.meta.event === 'channel_error')
+const newForwarder = (e: Env, old: number) =>
+  until('a new forwarder', () => {
+    const r = running(e)
+    return r.length === 1 && r[0][0] !== old ? r[0] : null
+  })
+const quietPr = (e: Env, sha: string) => {
+  serve(e, 'repos/o/r/pulls/7', { html_url: 'https://github.com/o/r/pull/7', head: { sha } })
+  for (const p of ['repos/o/r/issues/7/events', 'repos/o/r/issues/7/comments', 'repos/o/r/pulls/7/comments', 'repos/o/r/pulls/7/reviews']) serve(e, p, [])
+  serve(e, 'repos/o/r/actions/runs', { workflow_runs: [] })
+}
+
+test(
+  'after a sleep the daemon restarts its forwarders and recovers what it missed from the PR API, once',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_GAP_MS: '1000', FAKE_HEAD: 'aaaaaaa1' })
+    const d = await daemon(e)
+    const s = stream(d, 'sess-sleep')
+    await call(d, 'sess-sleep', 'subscribe_pr', 'o/r#7')
+    const [[first]] = await up(e)
+    await Bun.sleep(50)
+    // what happened while asleep; the hook that would have delivered it is gone, so only the PR API has it
+    const t = new Date().toISOString()
+    const old = new Date(Date.now() - 3600_000).toISOString() // before the subscription: never recovered
+    const url = 'https://github.com/o/r/pull/7'
+    serve(e, 'repos/o/r/pulls/7', { html_url: url, head: { sha: 'bbbbbbb2' } })
+    const pushed = new Date(Date.parse(t) - 1000).toISOString()
+    // three pages, newest last: page 2 reaches back past the gap, so page 1 is never read (its event would show)
+    serve(e, 'repos/o/r/issues/7/events', [{ id: 9, event: 'labeled', actor: { login: 'amy' }, label: { name: 'page-one' }, created_at: t }])
+    writeFileSync(`${e.api}/repos_o_r_issues_7_events@last`, '3')
+    serve(e, 'repos/o/r/issues/7/events@2', [{ id: 3, event: 'labeled', actor: { login: 'amy' }, label: { name: 'old' }, created_at: old }])
+    serve(e, 'repos/o/r/issues/7/events@3', [
+      { id: 1, event: 'labeled', actor: { login: 'amy' }, label: { name: 'bug' }, created_at: t },
+      { id: 2, event: 'subscribed', actor: { login: 'amy' }, created_at: t },
+      { id: 4, event: 'added_to_merge_queue', actor: { login: 'amy' }, created_at: t },
+    ])
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(900, old), apiComment(901, t)])
+    serve(e, 'repos/o/r/pulls/7/comments', [{ id: 950, user: { login: 'cy' }, path: 'a.ts', line: 3, html_url: `${url}#r950`, body: 'nit', created_at: t }])
+    serve(e, 'repos/o/r/pulls/7/reviews', [
+      { id: 960, user: { login: 'dee' }, state: 'APPROVED', body: 'lgtm', html_url: `${url}#v960`, submitted_at: t },
+      { id: 961, user: { login: 'eve' }, state: 'DISMISSED', body: 'no', html_url: `${url}#v961`, submitted_at: t },
+    ])
+    // the head commit names who pushed and when
+    serve(e, 'repos/o/r/commits/bbbbbbb2', { author: { login: 'eve' }, commit: { committer: { date: pushed } } })
+    // served for both heads: the same run twice must still arrive once
+    const run = { id: 70, run_attempt: 1, name: 'ci', status: 'completed', conclusion: 'success', head_sha: 'bbbbbbb2', html_url: 'https://github.com/o/r/actions/runs/70', updated_at: t }
+    serve(e, 'repos/o/r/actions/runs', { workflow_runs: [run] })
+    serve(e, 'repos/o/r/commits/bbbbbbb2/check-suites', {
+      check_suites: [{ id: 80, status: 'completed', conclusion: 'failure', app: { slug: 'circle', name: 'Circle' }, head_sha: 'bbbbbbb2', updated_at: t }],
+    })
+
+    process.kill(d.pid, 'SIGSTOP') // the machine sleeps
+    await Bun.sleep(7000)
+    process.kill(d.pid, 'SIGCONT')
+    const [, args] = await newForwarder(e, first)
+    await until('recovered events', () => recovered(s).length === 8)
+    await Bun.sleep(300)
+    const got = recovered(s).map(g => body(g).replace('(recovered after a gap) ', '').split('\n')[0])
+    expect(got).toEqual([
+      'New commits pushed by eve: aaaaaaa..bbbbbbb',
+      'Label "bug" added by amy',
+      'Added to the merge queue',
+      'Comment by amy',
+      'Review comment by cy on a.ts:3',
+      'Review approved by dee',
+      'Workflow ci success on bbbbbbb',
+      'Checks failure (Circle) on bbbbbbb',
+    ])
+    expect(recovered(s).find(g => g.content.includes('hello 901'))!.meta).toEqual({ event: 'issue_comment', repo: 'o/r', pr: '7' })
+    expect(errors(s)).toEqual([])
+
+    // the same comment arriving live now is not repeated; a new one is delivered as usual
+    const n = s.got.length
+    await commentHook(d, secretOf(args), apiComment(901, t))
+    await commentHook(d, secretOf(args), apiComment(902, new Date().toISOString()))
+    await until('live delivery', () => s.got.some(g => g.content.includes('hello 902')))
+    expect(s.got.slice(n).map(g => g.content.split('\n')[0])).toEqual(['o/r#7: Comment by amy']) // led by the PR's name
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a forwarder that exits is restarted and its PRs caught up, rather than its subscriptions dropped',
+  async () => {
+    const e = setup()
+    const d = await daemon(e)
+    const s = stream(d, 'sess-die')
+    await call(d, 'sess-die', 'subscribe_pr', 'o/r#7')
+    const [[first]] = await up(e)
+    await Bun.sleep(50)
+    quietPr(e, 'ccccccc3')
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(990, new Date().toISOString())])
+    process.kill(first, 'SIGTERM') // gh-webhook exits like this when its connection drops
+    await newForwarder(e, first)
+    await until('recovered comment', () => recovered(s).length === 1)
+    expect(recovered(s)[0].content).toContain('hello 990')
+    expect(errors(s)).toEqual([])
+    expect((await call(d, 'sess-die', 'unsubscribe_pr', 'o/r#8')).text).toBe('subscribed: o/r#7') // still subscribed
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a restarted daemon catches up from where the last one stopped, without repeating anything',
+  async () => {
+    const e = setup()
+    const d1 = await daemon(e)
+    const s1 = stream(d1, 'sess-rs')
+    await call(d1, 'sess-rs', 'subscribe_pr', 'o/r#7')
+    const [[f1, args]] = await up(e)
+    await Bun.sleep(50)
+    const delivered = apiComment(501, new Date().toISOString())
+    await commentHook(d1, secretOf(args), delivered)
+    await until('live delivery', () => s1.got.some(g => g.content.includes('hello 501')))
+    await s1.close()
+    d1.p.kill('SIGTERM')
+    await d1.p.exited
+    // while no daemon ran: one new comment, next to the one already delivered
+    quietPr(e, 'ddddddd4')
+    serve(e, 'repos/o/r/issues/7/comments', [delivered, apiComment(502, new Date().toISOString())])
+
+    const d2 = await daemon(e)
+    const [f2] = await newForwarder(e, f1)
+    const s2 = stream(d2, 'sess-rs')
+    await until('recovered comment', () => recovered(s2).length >= 1)
+    await Bun.sleep(500)
+    expect(recovered(s2).map(g => g.content.split('\n')[2])).toEqual(['hello 502'])
+    await s2.close()
+    d2.p.kill('SIGTERM')
+    await d2.p.exited
+
+    // and a third daemon finds nothing it hasn't already delivered
+    const d3 = await daemon(e)
+    await newForwarder(e, f2)
+    const s3 = stream(d3, 'sess-rs')
+    await until('connected', () => s3.got.length)
+    await Bun.sleep(4500) // past the forwarder's 3s start, after which it catches up
+    expect(s3.got.map(g => g.content)).toEqual(['watching: o/r#7'])
+    await s3.close()
+  },
+  T,
+)
+
+const prHook = (d: Daemon, secret: string, action: string, extra: object = {}) =>
+  hook(d, secret, 'pull_request', {
+    action,
+    number: 7,
+    pull_request: { html_url: 'https://github.com/o/r/pull/7', head: { sha: 'eeeeeee5' } },
+    repository: { full_name: 'o/r' },
+    sender: { login: 'amy' },
+    ...extra,
+  })
+const issueEvent = (id: number, event: string, extra: object = {}) => ({ id, event, actor: { login: 'amy' }, created_at: new Date().toISOString(), ...extra })
+
+test(
+  'repeated live PR actions all arrive, and a catch-up matches each to its live copy by time',
+  async () => {
+    const e = setup()
+    const d = await daemon(e)
+    const s = stream(d, 'sess-tog')
+    await call(d, 'sess-tog', 'subscribe_pr', 'o/r#7')
+    const [[first, args]] = await up(e)
+    const secret = secretOf(args)
+    const bob = { requested_reviewer: { login: 'bob' } }
+    const bug = { label: { name: 'bug' } }
+    const toggles: [string, object][] = [
+      ['review_requested', bob],
+      ['review_requested', bob],
+      ['labeled', bug],
+      ['unlabeled', bug],
+      ['labeled', bug],
+      ['converted_to_draft', {}],
+      ['ready_for_review', {}],
+      ['converted_to_draft', {}],
+      ['ready_for_review', {}],
+    ]
+    for (const [action, extra] of toggles) await prHook(d, secret, action, extra)
+    await until('every toggle', () => s.got.length === toggles.length)
+    expect(s.got.map(g => body(g).split('\n')[0])).toEqual([
+      'Review requested from bob by amy',
+      'Review requested from bob by amy',
+      'Label "bug" added by amy',
+      'Label "bug" removed by amy',
+      'Label "bug" added by amy',
+      'PR converted to draft by amy',
+      'PR marked ready for review by amy',
+      'PR converted to draft by amy',
+      'PR marked ready for review by amy',
+    ])
+    // the API lists the same nine, plus one that only happened while the forwarder was down
+    quietPr(e, 'eeeeeee5')
+    serve(e, 'repos/o/r/issues/7/events', [
+      ...toggles.map(([action, extra], i) =>
+        issueEvent(i + 1, ({ converted_to_draft: 'convert_to_draft' } as Record<string, string>)[action] ?? action, extra),
+      ),
+      issueEvent(20, 'labeled', { label: { name: 'missed' } }),
+    ])
+    process.kill(first, 'SIGTERM')
+    await newForwarder(e, first)
+    await until('recovered label', () => recovered(s).length)
+    await Bun.sleep(500)
+    expect(recovered(s).map(g => g.content.split('\n')[0])).toEqual(['o/r#7: (recovered after a gap) Label "missed" added by amy'])
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a live event while the restarted forwarder starts does not close the gap: the catch-up still starts from it',
+  async () => {
+    const e = setup()
+    const hour = 3600_000
+    // a session last caught up two hours ago, with a comment from an hour ago waiting in the API
+    writeFileSync(
+      `${e.dir}/sessions.json`,
+      JSON.stringify({
+        'sess-gap': { subs: ['o/r#7'], lastSeen: Date.now() },
+        '#seen': { 'o/r#7': { since: Date.now() - 2 * hour, at: Date.now() - 3 * hour, done: [] } },
+      }),
+    )
+    quietPr(e, 'fffffff6')
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(700, new Date(Date.now() - hour).toISOString())])
+    const d = await daemon(e)
+    const [[, args]] = await up(e) // spawned, inside its 3s start window
+    await commentHook(d, secretOf(args), apiComment(701, new Date().toISOString()))
+    const s = stream(d, 'sess-gap')
+    await until('both comments', () => s.got.some(g => g.content.includes('hello 700')) && s.got.some(g => g.content.includes('hello 701')))
+    expect(recovered(s).map(g => g.content.split('\n')[2])).toEqual(['hello 700'])
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a catch-up that cannot succeed says so, naming the PR, the time and why; gh older than 2.48 is called out',
+  async () => {
+    for (const [env, why] of [
+      [{ FAKE_GH_VERSION: '2.40.0', FAKE_NO_SLURP: '1' }, 'gh 2.40 is older than 2.48'],
+      [{ FAKE_NO_SLURP: '1', GH_PR_EVENTS_RETRY_MS: '200' }, 'unknown flag: --slurp'],
+    ] as [Record<string, string>, string][]) {
+      const e = setup(env)
+      const d = await daemon(e)
+      const s = stream(d, 'sess-fail')
+      await call(d, 'sess-fail', 'subscribe_pr', 'o/r#7')
+      const [[first]] = await up(e)
+      quietPr(e, 'aaaaaaa7')
+      process.kill(first, 'SIGTERM')
+      await newForwarder(e, first)
+      const [err] = await until('the failure notice', () => (errors(s).length ? errors(s) : null))
+      expect(err.content).toMatch(/^o\/r#7: pr-events could not recover the events missed since \d{4}-\d\d-\d\dT[\d:.]+Z: /)
+      expect(err.content).toContain(why)
+      await s.close()
+    }
+  },
+  60_000,
+)
+
+test(
+  'a daemon stopped while a forwarder restart is pending leaves no forwarder behind',
+  async () => {
+    const e = setup({ FAKE_SLOW_EXIT: '1' }) // forwarders take 3s to exit, so stop() outlasts the 1s restart backoff
+    const d = await daemon(e)
+    await call(d, 'sess-stop', 'subscribe_pr', 'o/r#7')
+    await call(d, 'sess-stop', 'subscribe_pr', 'o/s#1')
+    const fwds = await up(e, 2)
+    const [dying] = fwds.find(([, a]) => a.includes('--repo=o/r'))!
+    process.kill(dying, 'SIGTERM')
+    await until('forwarder gone', () => !alive(dying), 10_000)
+    await Bun.sleep(300) // the daemon has seen it go and scheduled the restart
+    d.p.kill('SIGTERM')
+    await d.p.exited
+    await Bun.sleep(1500)
+    expect(running(e)).toEqual([])
+    expect(forwarders(e).size).toBe(2) // and none was started after the first two
+  },
+  T,
+)
+
+test(
+  'a catch-up that finishes after the PR fell behind again leaves the new gap open',
+  async () => {
+    const e = setup({ FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    const hour = 3600_000
+    writeFileSync(
+      `${e.dir}/sessions.json`,
+      JSON.stringify({
+        'sess-gen': { subs: ['o/r#7'], lastSeen: Date.now() },
+        '#seen': { 'o/r#7': { since: Date.now() - 2 * hour, at: Date.now() - 3 * hour, done: [] } },
+      }),
+    )
+    quietPr(e, 'abcdef08')
+    writeFileSync(`${e.api}/repos_o_r_actions_runs.delay`, '1') // holds each catch-up about 2s
+    const runsDone = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8').match(/done repos\/o\/r\/actions\/runs/g)?.length ?? 0 : 0)
+    const d = await daemon(e)
+    const [[first, args]] = await up(e)
+    // catch-up A (for the restore) starts once the forwarder is up: fall behind again while it runs
+    await until('catch-up A started', () => existsSync(e.env.FAKE_GH_LOG) && readFileSync(e.env.FAKE_GH_LOG, 'utf8').includes('done repos/o/r/pulls/7'))
+    process.kill(first, 'SIGTERM')
+    await until('catch-up A done', () => runsDone() >= 2) // both of its runs calls; B can't start for another ~2s
+    await Bun.sleep(100)
+    // a live event before catch-up B, and a comment from the second gap, older than the slack before that event
+    await commentHook(d, secretOf(args), apiComment(801, new Date().toISOString()))
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(800, new Date(Date.now() - hour / 2).toISOString())])
+    await newForwarder(e, first)
+    const s = stream(d, 'sess-gen')
+    await until('recovered comment', () => recovered(s).length, 20_000)
+    expect(recovered(s).map(g => g.content.split('\n')[2])).toEqual(['hello 800'])
+    await s.close()
+  },
+  T,
+)
+
+// ---- closing and reopening ----
+
+const closedHook = (d: Daemon, secret: string, merged: boolean) =>
+  prHook(d, secret, 'closed', { pull_request: { html_url: 'https://github.com/o/r/pull/7', merged, head: { sha: 'eeeeeee5' } } })
+
+test(
+  'a PR closed without merging stays subscribed in case it is reopened, across a restart; a merge unsubscribes',
+  async () => {
+    const e = setup()
+    const d1 = await daemon(e)
+    const s1 = stream(d1, 'sess-close')
+    await call(d1, 'sess-close', 'subscribe_pr', 'o/r#7')
+    const [[f1, a1]] = await up(e)
+    await closedHook(d1, secretOf(a1), false)
+    await until('close notice', () => s1.got.length)
+    expect(s1.got[0].content).toBe("o/r#7: PR closed without merging by amy\nhttps://github.com/o/r/pull/7\n(still watching for 24h in case it's reopened)")
+    expect((await call(d1, 'sess-close', 'unsubscribe_pr', 'o/r#8')).text).toBe('subscribed: o/r#7')
+    await s1.close()
+    d1.p.kill('SIGTERM')
+    await d1.p.exited
+
+    const d2 = await daemon(e)
+    const [, a2] = await newForwarder(e, f1)
+    await until('forwarder up', async () => (await call(d2, 'sess-close', 'subscribe_pr', 'o/r#7')).text === 'subscribed: o/r#7')
+    const s2 = stream(d2, 'sess-close')
+    await prHook(d2, secretOf(a2), 'reopened')
+    await until('reopen', () => s2.got.some(g => g.content.startsWith('o/r#7: PR reopened by amy')))
+    expect(JSON.parse(readFileSync(`${e.dir}/sessions.json`, 'utf8'))['#seen']['o/r#7'].closed).toBeUndefined()
+    await closedHook(d2, secretOf(a2), true)
+    await until('merge', () => s2.got.some(g => g.content.includes('(unsubscribed automatically)')))
+    expect(s2.got.find(g => g.content.includes('merged'))!.content.split('\n')[0]).toBe('o/r#7: PR merged by amy')
+    await until('forwarder stopped', () => running(e).length === 0)
+    await s2.close()
+  },
+  T,
+)
+
+test(
+  'a closed PR that is not reopened in time is unsubscribed, and its session told',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_REOPEN_HOURS: '0.001' }) // 3.6s, checked every 5s
+    const d = await daemon(e)
+    const s = stream(d, 'sess-gone')
+    await call(d, 'sess-gone', 'subscribe_pr', 'o/r#7')
+    const [[, args]] = await up(e)
+    await closedHook(d, secretOf(args), false)
+    await until('expiry notice', () => s.got.some(g => g.content.includes('unsubscribed automatically')), 20_000)
+    expect(s.got.map(g => g.content.split('\n')[0])).toEqual([
+      'o/r#7: PR closed without merging by amy',
+      'o/r#7: Still closed after 0.001h; unsubscribed automatically',
+    ])
+    await until('forwarder stopped', () => running(e).length === 0)
+    expect((await call(d, 'sess-gone', 'unsubscribe_pr', 'o/r#7')).text).toBe('subscribed: none')
     await s.close()
   },
   T,

@@ -1,11 +1,11 @@
-name: gh-pr-events
+name: github plugin
 
 on:
   pull_request:
-    paths: ['plugins/gh-pr-events/**', '.github/workflows/gh-pr-events.yml']
+    paths: ['plugins/github/**', '.github/workflows/github-plugin.yml']
   push:
     branches: [main]
-    paths: ['plugins/gh-pr-events/**', '.github/workflows/gh-pr-events.yml']
+    paths: ['plugins/github/**', '.github/workflows/github-plugin.yml']
 
 jobs:
   test:
@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: plugins/gh-pr-events
+        working-directory: plugins/github
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
