@@ -17,6 +17,15 @@ const validSession = /^[\w-]{1,64}$/
 const PENDING_MAX = 100
 const IDLE_MS = 5 * 60_000
 const MAX_BODY = 25 * 1024 * 1024 // GitHub's own cap on a webhook payload
+const TICK_MS = 5000
+const GAP_MS = Number(process.env.GH_PR_EVENTS_GAP_MS ?? 30_000) // a tick this late means the machine slept (env: tests only)
+const SLACK_MS = 5 * 60_000 // a catch-up looks this far back before the gap; ids drop what was already delivered
+const MATCH_MS = 2 * 60_000 // a recovered PR action this close in time to a live one of the same kind is that one
+const RESTARTS = 10 // consecutive failed forwarder restarts (1s doubling to 60s apart, ~6 min) before giving up
+const RETRY_MS = Number(process.env.GH_PR_EVENTS_RETRY_MS ?? 30_000) // between catch-up attempts, 5 in all (env: tests only)
+const API_TIMEOUT_MS = 60_000
+const RECOVERED = '(recovered after a gap) '
+const REOPEN_HOURS = Number(process.env.GH_PR_EVENTS_REOPEN_HOURS ?? 24) // keep a closed, unmerged PR this long in case it's reopened
 
 type Ev = { content: string; meta: Record<string, string> }
 // A Claude session, known by its CLAUDE_CODE_SESSION_ID, which survives --resume. Streams: its shims' open event streams.
@@ -35,6 +44,35 @@ type Session = {
 type Sub = { pr: string; sessions: Set<string>; conflictBase?: string } // conflictBase: set while the PR conflicts with it
 // A repo's forwarder from the first subscribe on: `ready` settles once it has started (null) or failed (the error).
 type Fwd = { p?: Subprocess<'ignore', 'ignore', 'pipe'>; ready: Promise<string | null>; up: boolean; cancelled: boolean }
+// One delivered event, kept so a catch-up doesn't repeat it: its id, when it happened, and whether a catch-up sent it.
+// A PR action (label, review request, draft...) has no id GitHub repeats in its issue events, so live ones are kept
+// as `pr<action><subject>` and matched by time instead.
+type Done = { id: string; t: number; r?: true }
+// Per subscribed PR, what a catch-up needs: since: when it last had everything (a live event, or a catch-up's
+// start); gap: set while it's behind, where the catch-up must start from; at: when it was subscribed (nothing older
+// is recovered); gen: bumped each time it falls behind, so a catch-up only closes a gap that didn't reopen while it
+// ran; done: what it already delivered; head: its head sha; closed: when it was closed without merging, if it still is.
+type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number }
+
+const actionOf = (p: any) => `pr${p.action}${p.label?.name ?? p.requested_reviewer?.login ?? p.requested_team?.name ?? ''}`
+// An event's identity, the same whether it came live or from the API, so a catch-up never repeats one.
+function idOf(event: string, p: any): string | undefined {
+  switch (event) {
+    case 'issue_comment':
+      return `ic${p.comment?.id}`
+    case 'pull_request_review_comment':
+      return `rc${p.comment?.id}`
+    case 'pull_request_review':
+      return `r${p.review?.id}${p.action}`
+    case 'workflow_run':
+      return `w${p.workflow_run?.id}.${p.workflow_run?.run_attempt}`
+    case 'check_suite':
+      return `cs${p.check_suite?.id}@${p.check_suite?.updated_at}`
+    case 'pull_request':
+      if (p.action === 'synchronize') return `push${p.after}`
+      return p.issueEvent ? `ie${p.issueEvent}` : actionOf(p) // issueEvent: set on a recovered one
+  }
+}
 
 // SIGINT lets gh-webhook delete its webhook; escalate if it hangs (e.g. offline), and settle only once it's dead.
 function terminate(pid: number, exited?: Promise<unknown>): Promise<void> {
@@ -66,6 +104,16 @@ export async function startDaemon() {
   const live = new Set<number>() // every forwarder pid not yet seen to exit, ours or a dead daemon's
   const sessions = new Map<string, Session>()
   const subs = new Map<string, Sub>() // lowercased owner/repo#n (GitHub names are case-insensitive) -> who wants it
+  const seen = new Map<string, Seen>() // per key in subs, persisted with the sessions
+  const behind = new Set<string>() // repos whose forwarder was down or cut off: caught up once it's back
+  const restarts = new Map<string, number>() // repo -> failed restarts in a row
+  const waits = new Set<Timer>() // pending restarts and catch-up retries, cleared by stop()
+  const later = (fn: () => unknown, ms: number) => {
+    const t = setTimeout(() => (waits.delete(t), halting || fn()), ms)
+    waits.add(t)
+  }
+  let halting = false // stop() has begun: start nothing new
+  let ghOld = '' // set when gh is too old to catch up
   const inRepo = (repo: string) => [...subs.keys()].filter(k => k.startsWith(repo + '#'))
   const ttlMs = Number(process.env.GH_PR_EVENTS_SESSION_TTL_HOURS ?? 72) * 3600_000
   let url = '' // the webhook receiver's, set once elected
@@ -126,6 +174,8 @@ export async function startDaemon() {
       for (const [id, s] of sessions)
         if (!s.ephemeral && (s.subs.size || s.pending.length || s.dropped || s.expired))
           out[id] = { subs: [...s.subs.values()], pending: s.pending, dropped: s.dropped, lastSeen: s.lastSeen, beatDir: s.beatDir, expired: s.expired }
+      // not a valid session id, so a 2.0 daemon skips it; only PRs a saved session watches
+      out['#seen'] = Object.fromEntries([...seen].filter(([k]) => [...(subs.get(k)?.sessions ?? [])].some(id => !sessions.get(id)?.ephemeral)))
       writeJson(sessionsFile, out)
     } catch (e) {
       log('could not save sessions:', e)
@@ -142,8 +192,12 @@ export async function startDaemon() {
     s.pending.push(e)
     save()
   }
+  // Claude Code shows a notification as one line cut at the terminal width, rendering no markdown, so each PR
+  // event starts with the PR's name (owner/repo#n): it survives the cut where the URL doesn't.
+  const label = (sub: Sub, content: string) => `${sub.pr}: ${content}`
   const emitTo = (key: string, content: string, meta: Record<string, string>) => {
-    for (const id of subs.get(key)?.sessions ?? []) deliver(id, { content, meta })
+    const sub = subs.get(key)
+    for (const id of sub?.sessions ?? []) deliver(id, { content: label(sub!, content), meta })
   }
   // Drops a repo's subscriptions and tells their sessions, which can resubscribe.
   const dropRepo = (repo: string, why: string) => {
@@ -153,6 +207,7 @@ export async function startDaemon() {
         deliver(id, { content: why, meta: { event: 'channel_error' } })
       }
       subs.delete(k)
+      seen.delete(k)
     }
     save()
     armIdle()
@@ -184,6 +239,7 @@ export async function startDaemon() {
   function ensureForwarder(repo: string): Promise<string | null> {
     const existing = forwarders.get(repo)
     if (existing) return existing.ready
+    if (halting) return Promise.resolve('pr-events is shutting down')
     const f: Fwd = { up: false, cancelled: false, ready: Promise.resolve(null) }
     forwarders.set(repo, f)
     f.ready = (async () => {
@@ -214,30 +270,76 @@ export async function startDaemon() {
         return `gh webhook forward failed for ${repo}: ${firstLine}`
       }
       f.up = true
+      const upAt = Date.now()
       log(`forwarding ${repo} -> ${url}webhook`)
+      // gh-webhook exits on any lost connection (a sleep, a network change), and GitHub deletes its webhook
       p.exited.then(code =>
         serial(() => {
           if (forwarders.get(repo) !== f) return // stopped on purpose
           forwarders.delete(repo)
-          dropRepo(repo, `gh webhook forward for ${repo} exited ${code}; call subscribe_pr again to retry`)
+          fellBehind(repo)
+          if (Date.now() - upAt > 60_000) restarts.delete(repo) // it had been working: start counting afresh
+          restartLater(repo, `gh webhook forward for ${repo} exited ${code}`)
         }),
       )
       return null
     })().catch(e => `gh webhook forward failed for ${repo}: ${e}`)
-    // a failed start takes its waiting subscriptions with it; each subscriber gets the error as its reply
     f.ready.then(err =>
       serial(() => {
-        if (!err || forwarders.get(repo) !== f) return
+        if (forwarders.get(repo) !== f) return
+        if (!err) {
+          if (behind.delete(repo)) for (const k of inRepo(repo)) catchUp(k).catch(log)
+          return
+        }
         forwarders.delete(repo)
+        // a restart that failed (offline just after waking, say) keeps its subscriptions and tries again
+        if (behind.has(repo)) return restartLater(repo, err)
+        // a failed first start takes its waiting subscriptions with it; each subscriber gets the error as its reply
         for (const k of inRepo(repo)) {
           for (const id of subs.get(k)!.sessions) sessions.get(id)?.subs.delete(k)
           subs.delete(k)
+          seen.delete(k)
         }
         save()
         armIdle()
       }),
     )
     return f.ready
+  }
+
+  // The repo's PRs may have missed events from here on: each catch-up starts where it last had everything, and
+  // live events no longer move that point until it has. Called inside serial().
+  function fellBehind(repo: string) {
+    behind.add(repo)
+    for (const k of inRepo(repo)) {
+      const c = seen.get(k)
+      if (!c) continue
+      c.gap ??= c.since
+      c.gen = (c.gen ?? 0) + 1
+    }
+    save()
+  }
+
+  // Called inside serial(), with the repo in `behind`. Counts failures per repo, whoever starts the next attempt.
+  function restartLater(repo: string, why: string) {
+    const tries = restarts.get(repo) ?? 0
+    if (tries >= RESTARTS) {
+      behind.delete(repo)
+      restarts.delete(repo)
+      return dropRepo(repo, `${why}, and restarting it failed ${RESTARTS} times; call subscribe_pr again to retry`)
+    }
+    restarts.set(repo, tries + 1)
+    log(`${why}; restarting it (try ${tries + 1})`)
+    later(
+      () =>
+        serial(() => {
+          if (forwarders.has(repo)) return
+          if (inRepo(repo).length) return ensureForwarder(repo)
+          behind.delete(repo) // nothing left to catch up
+          restarts.delete(repo)
+        }),
+      Math.min(60_000, 1000 * 2 ** tries),
+    )
   }
 
   // Doesn't wait: the next start for the repo waits for the exit instead.
@@ -295,11 +397,11 @@ export async function startDaemon() {
       return ''
     }
   }
-  async function mergeability(repo: string, n: string): Promise<{ base: string; conflicted: boolean } | null> {
+  async function mergeability(repo: string, n: string): Promise<{ base: string; conflicted: boolean; head?: string } | null> {
     // ponytail: mergeable is null while GitHub recomputes after a push; 5 tries 3s apart, then give up silently
     for (let i = 0; i < 5; i++) {
-      const [base, m] = (await gh('api', `repos/${repo}/pulls/${n}`, '-q', '[.base.ref, .mergeable] | @tsv')).split('\t')
-      if (m === 'true' || m === 'false') return { base, conflicted: m === 'false' }
+      const [base, m, head] = (await gh('api', `repos/${repo}/pulls/${n}`, '-q', '[.base.ref, .mergeable, .head.sha] | @tsv')).split('\t')
+      if (m === 'true' || m === 'false') return { base, conflicted: m === 'false', head: head || undefined }
       await Bun.sleep(3000)
     }
     return null
@@ -318,6 +420,8 @@ export async function startDaemon() {
     const [repo, n] = first.pr.split('#')
     const r = await mergeability(repo, n)
     const s = subs.get(key)
+    const c = seen.get(key)
+    if (c && r?.head) c.head ??= r.head // where a catch-up spots pushes from
     if (!r || !s || (onlyBase && r.base !== onlyBase) || r.conflicted === !!s.conflictBase) return
     s.conflictBase = r.conflicted ? r.base : undefined
     const e = conflictEv(s, r.base, r.conflicted)
@@ -328,6 +432,169 @@ export async function startDaemon() {
   const forced = async (repo: string, before: string, after: string) =>
     ['diverged', 'behind'].includes(await gh('api', `repos/${repo}/compare/${before}...${after}`, '-q', '.status'))
 
+  // ---- catching up on what a sleep or a dead forwarder missed, from the PR's own API ----
+
+  // Throws on any failure, or after a minute, so a catch-up that didn't see everything isn't recorded as done.
+  // list: every page, flattened. raw: the response with its headers, one page only.
+  async function api(path: string, mode?: 'list' | 'raw'): Promise<any> {
+    if (ghOld) throw new Error(ghOld)
+    const args = mode === 'list' ? ['--paginate', '--slurp'] : mode === 'raw' ? ['-i'] : []
+    const p = Bun.spawn([process.env.GH_PR_EVENTS_GH ?? 'gh', 'api', ...args, path], { stdout: 'pipe', stderr: 'pipe', timeout: API_TIMEOUT_MS })
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
+    if (p.signalCode) throw new Error(`gh api ${path} timed out`)
+    if (code !== 0) throw new Error(`gh api ${path} failed: ${err.trim().split('\n')[0] || `exit ${code}`}`)
+    if (mode === 'list') return JSON.parse(out).flat()
+    if (mode !== 'raw') return JSON.parse(out)
+    const i = out.search(/\r?\n\r?\n/)
+    return { headers: out.slice(0, i), body: JSON.parse(out.slice(i).trim()) }
+  }
+
+  // A PR's issue events back to `after`. The API lists them oldest first only, so this reads the last page first
+  // and stops once past `after`, rather than paging through a long-lived PR's whole history.
+  async function issueEvents(path: string, after: number): Promise<any[]> {
+    const first = await api(`${path}?per_page=100`, 'raw')
+    const last = Number(first.headers.match(/[?&]page=(\d+)>; rel="last"/)?.[1] ?? 1)
+    const out: any[] = []
+    for (let page = last; page > 1; page--) {
+      const items = await api(`${path}?per_page=100&page=${page}`)
+      out.unshift(...items)
+      if (items.length && Date.parse(items[0].created_at) <= after) return out
+    }
+    return [...first.body, ...out]
+  }
+
+  // Everything that happened on the PR since it last had everything, replayed as the webhooks it missed would have
+  // been. A failure leaves the gap open and tries again; the last failure tells the PR's sessions.
+  async function catchUp(key: string, tries = 0): Promise<void> {
+    const c = seen.get(key)
+    const sub = subs.get(key)
+    if (!c || !sub) return
+    const from = c.gap ?? c.since
+    const gen = c.gen
+    const start = Date.now()
+    const after = Math.max(from - SLACK_MS, c.at)
+    const iso = new Date(after).toISOString()
+    const fresh = (t?: string | null) => !!t && Date.parse(t) > after
+    const [repo, n] = sub.pr.split('#')
+    const pr = Number(n)
+    const repository = { full_name: repo }
+    try {
+      const head = await api(`repos/${repo}/pulls/${n}`)
+      const sha: string = head.head.sha
+      const [events, comments, reviewComments, reviews, recentRuns] = await Promise.all([
+        issueEvents(`repos/${repo}/issues/${n}/events`, after),
+        api(`repos/${repo}/issues/${n}/comments?per_page=100&since=${iso}`, 'list'),
+        api(`repos/${repo}/pulls/${n}/comments?per_page=100&since=${iso}`, 'list'),
+        api(`repos/${repo}/pulls/${n}/reviews?per_page=100`, 'list'),
+        // runs started during the gap, on any head the PR had then
+        api(`repos/${repo}/actions/runs?per_page=100&created=${encodeURIComponent('>=' + iso)}`, 'list'),
+      ])
+      // and CI that started before the gap: on the head, and on the old head if it moved (gone after a force push)
+      const shas = [...new Set([c.head, sha].filter(Boolean))] as string[]
+      const ci = await Promise.all(
+        shas.map(async s => {
+          const [runs, suites] = await Promise.all([
+            api(`repos/${repo}/actions/runs?per_page=100&head_sha=${s}`, 'list').catch(() => []),
+            api(`repos/${repo}/commits/${s}/check-suites?per_page=100`, 'list').catch(() => []),
+          ])
+          return { runs: runs.flatMap((p: any) => p.workflow_runs ?? []), suites: suites.flatMap((p: any) => p.check_suites ?? []) }
+        }),
+      )
+      const runs = [
+        ...recentRuns.flatMap((p: any) => p.workflow_runs ?? []).filter((w: any) => w.pull_requests?.some((x: any) => x.number === pr)),
+        ...ci.flatMap(x => x.runs),
+      ]
+      const missed: { t: string; event: string; payload: any }[] = []
+      const merges = events.filter((e: any) => e.event === 'merged').map((e: any) => Date.parse(e.created_at))
+      const actions: Record<string, string> = {
+        merged: 'closed',
+        convert_to_draft: 'converted_to_draft',
+        added_to_merge_queue: 'enqueued',
+        removed_from_merge_queue: 'dequeued',
+      }
+      for (const e of events) {
+        // a merge also logs a closed event at the same moment
+        if (!fresh(e.created_at) || (e.event === 'closed' && merges.some((m: number) => Math.abs(m - Date.parse(e.created_at)) < 10_000))) continue
+        const pull_request = { html_url: head.html_url, merged: e.event === 'merged', head: head.head }
+        missed.push({
+          t: e.created_at,
+          event: 'pull_request',
+          payload: {
+            action: actions[e.event] ?? e.event,
+            issueEvent: e.id,
+            number: pr,
+            pull_request,
+            repository,
+            sender: e.actor,
+            label: e.label,
+            requested_reviewer: e.requested_reviewer,
+            requested_team: e.requested_team,
+          },
+        })
+      }
+      for (const cm of comments)
+        if (fresh(cm.created_at))
+          missed.push({ t: cm.created_at, event: 'issue_comment', payload: { action: 'created', repository, sender: cm.user, issue: { number: pr, pull_request: {} }, comment: cm } })
+      for (const cm of reviewComments)
+        if (fresh(cm.created_at))
+          missed.push({ t: cm.created_at, event: 'pull_request_review_comment', payload: { action: 'created', repository, sender: cm.user, pull_request: { number: pr }, comment: cm } })
+      for (const r of reviews)
+        if (fresh(r.submitted_at) && r.state !== 'DISMISSED')
+          missed.push({
+            t: r.submitted_at,
+            event: 'pull_request_review',
+            payload: { action: 'submitted', repository, sender: r.user, pull_request: { number: pr }, review: { ...r, state: String(r.state).toLowerCase() } },
+          })
+      for (const w of runs)
+        if (w.status === 'completed' && fresh(w.updated_at))
+          missed.push({ t: w.updated_at, event: 'workflow_run', payload: { action: 'completed', repository, workflow_run: { ...w, pull_requests: [{ number: pr }] } } })
+      for (const s of ci.flatMap(x => x.suites))
+        if (s.status === 'completed' && fresh(s.updated_at))
+          missed.push({ t: s.updated_at, event: 'check_suite', payload: { action: 'completed', repository, check_suite: { ...s, pull_requests: [{ number: pr }] } } })
+      // new commits, from the head commit's author at its commit time
+      if (c.head && c.head !== sha) {
+        const commit = await api(`repos/${repo}/commits/${sha}`)
+        missed.push({
+          t: commit.commit?.committer?.date ?? '',
+          event: 'pull_request',
+          payload: {
+            action: 'synchronize',
+            number: pr,
+            before: c.head,
+            after: sha,
+            pull_request: { html_url: head.html_url },
+            repository,
+            sender: { login: commit.author?.login ?? commit.commit?.author?.name ?? 'someone' },
+          },
+        })
+      }
+      missed.sort((a, b) => a.t.localeCompare(b.t))
+      for (const m of missed) await handle(m.event, m.payload, Date.parse(m.t) || start)
+      c.head = sha
+      // fell behind again meanwhile (a second sleep): leave the gap for the catch-up that follows
+      if (c.gen === gen) {
+        c.since = Math.max(c.since, start)
+        c.gap = undefined
+      }
+      prune(c)
+      if (missed.length) log(`caught up ${sub.pr} from ${new Date(from).toISOString()}`)
+      save()
+      recheck(key).catch(log) // the base may have moved meanwhile
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e)
+      log(`catch-up for ${sub.pr} failed (${why})`)
+      if (tries < 4 && !ghOld) return later(() => catchUp(key, tries + 1).catch(log), RETRY_MS)
+      // the gap stays open, so the next sleep or restart tries again
+      emitTo(key, `pr-events could not recover the events missed since ${new Date(from).toISOString()}: ${why}`, { event: 'channel_error' }) // led by the PR's name
+    }
+  }
+
+  // Forgets delivered events too old for any catch-up window to reach again.
+  const prune = (c: Seen) => {
+    const keep = Math.min(c.since, c.gap ?? c.since) - 2 * SLACK_MS
+    c.done = c.done.filter(d => d.t >= keep)
+  }
+
   // ---- the state changes; only ever called through serial() ----
 
   // Registers interest at once and returns the forwarder's start to wait on outside the queue.
@@ -337,13 +604,17 @@ export async function startDaemon() {
     let sub = subs.get(key)
     if (!sub) {
       subs.set(key, (sub = { pr, sessions: new Set() }))
+      if (!seen.has(key)) seen.set(key, { since: Date.now(), at: Date.now(), done: [] }) // a restored one keeps its own
       recheck(key).catch(log) // reports a PR that already has conflicts
     }
     sub.sessions.add(id)
     s.subs.set(key, pr)
     save()
     // a later subscriber still hears about a conflict the others were already told about
-    if (sub.conflictBase) deliver(id, conflictEv(sub, sub.conflictBase, true))
+    if (sub.conflictBase) {
+      const e = conflictEv(sub, sub.conflictBase, true)
+      deliver(id, { ...e, content: label(sub, e.content) })
+    }
     return { ready: ensureForwarder(key.split('#')[0]) }
   }
 
@@ -358,6 +629,7 @@ export async function startDaemon() {
     save()
     if (sub.sessions.size) return
     subs.delete(key)
+    seen.delete(key)
     const repo = key.split('#')[0]
     if (!inRepo(repo).length) stopForwarder(repo)
     armIdle()
@@ -400,10 +672,10 @@ export async function startDaemon() {
     if (beatDir && isAbsolute(beatDir)) s.beatDir = beatDir // relative would resolve against the daemon's cwd
     if (name === 'subscribe_pr') {
       const { ready } = await serial(() => subscribe(id, pr))
-      let err = await ready
-      // it may have been unsubscribed, or closed, while the forwarder started: only claim what the daemon still has
-      if (!err && !(await serial(() => s.subs.has(key)))) err = cancelledMsg
-      if (err) return { text: err, isError: true }
+      const err = await ready
+      // it may have been unsubscribed, or closed, while the forwarder started: only claim what the daemon still has.
+      // A failed restart keeps it (and retries), so that's no error.
+      if (!(await serial(() => s.subs.has(key)))) return { text: err ?? cancelledMsg, isError: true }
       beat()
     } else if (name === 'unsubscribe_pr') await serial(() => unsubscribe(key, id))
     else return { text: `unknown tool: ${name}`, isError: true }
@@ -421,15 +693,41 @@ export async function startDaemon() {
   async function onWebhook(req: Request) {
     const body = await req.text()
     if (!verified(body, req.headers.get('x-hub-signature-256'), secret)) return new Response('bad signature', { status: 401 })
-    const event = req.headers.get('x-github-event') ?? ''
     let payload: any
-    let e: Event = null
     try {
       payload = JSON.parse(body)
+    } catch {
+      return new Response('ok')
+    }
+    await handle(req.headers.get('x-github-event') ?? '', payload)
+    return new Response('ok')
+  }
+
+  // Whether a recovered event was already delivered; if not, records it. A recovered PR action is the live one of
+  // the same kind closest to it in time (within MATCH_MS), and each live one stands for one recovered one.
+  function deliveredBefore(c: Seen, id: string, payload: any, at: number) {
+    if (c.done.some(d => d.id === id)) return true
+    if (payload.issueEvent) {
+      const a = actionOf(payload)
+      const live = c.done
+        .filter(d => d.id === a && Math.abs(d.t - at) < MATCH_MS)
+        .sort((x, y) => Math.abs(x.t - at) - Math.abs(y.t - at))[0]
+      if (live) return ((live.id = id), (live.r = true), true)
+    }
+    c.done.push({ id, t: at, r: true })
+    return false
+  }
+
+  // One event, live (HMAC checked) or recovered by a catch-up (fetched from GitHub's API under the user's gh auth;
+  // recoveredAt: when it happened).
+  async function handle(event: string, payload: any, recoveredAt?: number) {
+    const recovered = recoveredAt !== undefined
+    let e: Event = null
+    try {
       e = summarise(event, payload)
     } catch (err) {
       log('summarise failed', event, err)
-      return new Response('ok')
+      return
     }
     const repo = String(payload.repository?.full_name)
     const key = `${repo}#${e?.pr}`.toLowerCase()
@@ -437,18 +735,43 @@ export async function startDaemon() {
       const branch = payload.ref.slice('refs/heads/'.length)
       for (const k of inRepo(repo.toLowerCase())) recheck(k, branch).catch(log)
     }
-    if (event === 'pull_request' && payload.action === 'synchronize' && subs.has(key)) recheck(key).catch(log)
+    if (event === 'pull_request' && payload.action === 'synchronize' && subs.has(key) && !recovered) recheck(key).catch(log)
+    const c = seen.get(key)
+    if (c && event === 'pull_request' && payload.action === 'reopened') c.closed = undefined
+    if (c && !recovered) {
+      if (c.gap === undefined) c.since = Date.now() // everything up to now has arrived, unless a gap is still open
+      if (event === 'pull_request') c.head = payload.pull_request?.head?.sha ?? payload.after ?? c.head
+    }
     const wanted = e && subs.has(key)
-    log(event, wanted ? 'emitted' : 'ignored')
-    if (!e || !wanted) return new Response('ok')
+    log(event, wanted ? 'emitted' : 'ignored', recovered ? '(recovered)' : '')
+    if (!e || !wanted) return
+    const id = idOf(event, payload)
+    if (c && id) {
+      if (recovered) {
+        if (deliveredBefore(c, id, payload, recoveredAt)) return // saved once the catch-up is done
+      } else {
+        // live events are never deduped against each other, only against a catch-up that got there first (the
+        // event a dying forwarder still hands over, say)
+        if (c.done.some(d => d.r && d.id === id)) return
+        c.done.push({ id, t: Date.now() })
+        prune(c)
+        save()
+      }
+    }
     if (event === 'pull_request' && payload.action === 'synchronize' && (await forced(repo, payload.before, payload.after))) {
       e.text = e.text.replace('New commits pushed by', 'Force-pushed by').replace('\n', ' (history rewritten)\n')
     }
+    const text = recovered ? RECOVERED + e.text : e.text
     const meta = { event, repo, pr: String(e.pr) }
-    if (!e.done) emitTo(key, e.text, meta)
+    if (!e.done) emitTo(key, text, meta)
+    // closed without merging: it may be reopened, so keep watching for a while (closedCheck ends it)
+    else if (!payload.pull_request?.merged && c) {
+      c.closed = Date.now()
+      save()
+      emitTo(key, `${text}\n(still watching for ${REOPEN_HOURS}h in case it's reopened)`, meta)
+    }
     // in one step, so whoever is subscribed when it's applied is told, including a subscribe that was queued
-    else serial(() => (emitTo(key, e.text + '\n(unsubscribed automatically)', meta), unsubscribe(key)))
-    return new Response('ok')
+    else serial(() => (emitTo(key, text + '\n(unsubscribed automatically)', meta), unsubscribe(key)))
   }
 
   // A shim's event stream: what the session is watching, then anything it missed, then live events, until the shim
@@ -485,19 +808,19 @@ export async function startDaemon() {
         s.lastSeen = Date.now()
         clearTimeout(idle)
         if (quarantined && !told.has(id))
-          send({ content: "gh-pr-events couldn't read its saved subscriptions; if this session had any, call subscribe_pr again", meta: { event: 'channel_error' } })
+          send({ content: "pr-events couldn't read its saved subscriptions; if this session had any, call subscribe_pr again", meta: { event: 'channel_error' } })
         told.add(id)
         const watching = [...s.subs.values()]
         // "none" only on a reconnect, so a new session isn't woken just to hear it watches nothing
         if (watching.length || req.headers.get('x-reconnect')) send({ content: `watching: ${watching.join(', ') || 'none'}`, meta: { event: 'watching' } })
         if (s.expired) {
           send({
-            content: `gh-pr-events forgot this session's subscriptions after ${hours} away: ${s.expired.prs.join(', ')}. Call subscribe_pr again to resume`,
+            content: `pr-events forgot this session's subscriptions after ${hours} away: ${s.expired.prs.join(', ')}. Call subscribe_pr again to resume`,
             meta: { event: 'channel_error' },
           })
           s.expired = undefined
         }
-        if (s.dropped) send({ content: `${s.dropped} older gh-pr-events notifications were dropped while this session was away`, meta: { event: 'channel_error' } })
+        if (s.dropped) send({ content: `${s.dropped} older pr-events notifications were dropped while this session was away`, meta: { event: 'channel_error' } })
         s.dropped = 0
         for (const e of s.pending.splice(0)) send(e)
         save()
@@ -603,7 +926,20 @@ export async function startDaemon() {
   // Restore persisted sessions, and start forwarders for their subscriptions so events queue even with nobody connected.
   // A session that expired while no daemon ran gets its tombstone here instead.
   const now = Date.now()
-  for (const [id, v] of Object.entries(loadSessions())) {
+  const saved = loadSessions()
+  for (const [k, v] of Object.entries((saved['#seen'] ?? {}) as Record<string, any>))
+    if (Number.isFinite(v?.since) && Array.isArray(v.done))
+      seen.set(k, {
+        since: v.since,
+        gap: Number.isFinite(v.gap) ? v.gap : undefined,
+        at: Number.isFinite(v.at) ? v.at : v.since,
+        done: v.done
+          .filter((d: any) => typeof d?.id === 'string' && Number.isFinite(d.t))
+          .map((d: any) => ({ id: d.id, t: d.t, ...(d.r && { r: true as const }) })),
+        head: typeof v.head === 'string' ? v.head : undefined,
+        closed: Number.isFinite(v.closed) ? v.closed : undefined,
+      })
+  for (const [id, v] of Object.entries(saved)) {
     if (!validSession.test(id) || !v || typeof v !== 'object' || Array.isArray(v)) continue
     const lastSeen = Number(v.lastSeen) || 0
     const prs = (Array.isArray(v.subs) ? v.subs : []).filter((pr: unknown) => typeof pr === 'string' && parsePr(pr)) as string[]
@@ -624,23 +960,62 @@ export async function startDaemon() {
     s.beatDir = typeof v.beatDir === 'string' && isAbsolute(v.beatDir) ? v.beatDir : undefined
     s.pending = (Array.isArray(v.pending) ? v.pending : []).filter((e: any) => typeof e?.content === 'string').slice(-PENDING_MAX)
     s.dropped = Number.isInteger(v.dropped) && v.dropped > 0 ? v.dropped : 0
-    for (const pr of prs)
-      serial(() => subscribe(id, pr)).then(({ ready }) =>
-        ready.then(err => err && deliver(id, { content: `Could not resume the subscription to ${pr}: ${err}`, meta: { event: 'channel_error' } })),
-      )
+    // nothing ran while no daemon did: catch up once the forwarder is back, and keep retrying it until then
+    for (const pr of prs) serial(() => (subscribe(id, pr), fellBehind(pr.toLowerCase().split('#')[0])))
   }
-  serial(() => (save(), armIdle())) // after the restored subscribes, which run in this queue too
+  // after the restored subscribes, which run in this queue too
+  serial(() => {
+    for (const k of seen.keys()) if (!subs.has(k)) seen.delete(k)
+    save()
+    armIdle()
+  })
+  // A timer that fires far later than it should means the machine slept: the forwarders' connections died with it
+  // and GitHub has deleted their webhooks, so start them afresh and catch up.
+  let tick = Date.now()
+  const sleepCheck = () => {
+    const late = Date.now() - tick - TICK_MS
+    tick = Date.now()
+    if (late <= GAP_MS) return
+    serial(() => {
+      log(`woke after ~${Math.round(late / 1000)}s asleep; restarting forwarders`)
+      for (const repo of new Set([...subs.keys()].map(k => k.split('#')[0]))) {
+        fellBehind(repo)
+        restarts.delete(repo)
+        stopForwarder(repo)
+        ensureForwarder(repo)
+      }
+    })
+  }
+  // A PR closed without merging that wasn't reopened in time is done with.
+  const closedCheck = () => {
+    for (const [k, c] of seen)
+      if (c.closed && Date.now() - c.closed > REOPEN_HOURS * 3600_000)
+        serial(() => {
+          if (!seen.get(k)?.closed || !subs.has(k)) return
+          const [repo, n] = subs.get(k)!.pr.split('#')
+          emitTo(k, `Still closed after ${REOPEN_HOURS}h; unsubscribed automatically`, { event: 'pull_request', repo, pr: n })
+          unsubscribe(k)
+        })
+  }
   const timers = [
     setInterval(beat, 4 * 60_000), // the Stop hook wants a beat every 15 min
     setInterval(() => serial(expire), Math.max(1000, Math.min(3600_000, ttlMs / 2))),
     // a daemon that daemon.json no longer names can't be found by shims, so it only holds webhooks: step aside
     setInterval(() => !owned() && quit('daemon.json names another daemon'), 5000),
+    setInterval(() => (sleepCheck(), closedCheck()), TICK_MS),
   ]
   log(`daemon ${process.pid} ${version} on ${url}`)
+  // catching up pages with `gh api --slurp`, which gh 2.48 added
+  gh('--version').then(v => {
+    const [maj, min] = (v.match(/gh version (\d+)\.(\d+)/) ?? []).slice(1).map(Number)
+    if (maj < 2 || (maj === 2 && min < 48)) log((ghOld = `gh ${maj}.${min} is older than 2.48, which catching up after a gap needs; upgrade gh`))
+  })
 
   let stopping: Promise<void> | undefined
   const stop = () =>
     (stopping ??= (async () => {
+      halting = true // before anything awaits: no restart may start a forwarder now
+      waits.forEach(clearTimeout)
       timers.forEach(clearInterval)
       clearTimeout(idle)
       http!.stop(true)

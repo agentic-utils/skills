@@ -2,10 +2,10 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from 'node:fs'
 
-export const log = (...a: unknown[]) => console.error('[gh-pr-events]', ...a) // stdout is the shim's MCP pipe
+export const log = (...a: unknown[]) => console.error('[pr-events]', ...a) // stdout is the shim's MCP pipe
 
 // read on use, not at import, so a test can point it elsewhere
-export const stateDir = () => process.env.GH_PR_EVENTS_STATE_DIR ?? `${process.env.HOME}/.claude/state/gh-pr-events`
+export const stateDir = () => process.env.GH_PR_EVENTS_STATE_DIR ?? `${process.env.HOME}/.claude/state/pr-events`
 
 // Holds the daemon's token and pid files: whoever can read it can talk to the daemon, so it must be ours alone.
 export function privateStateDir(): string {
@@ -51,7 +51,7 @@ export const newer = (a: string, b: string) => {
 
 // A daemon proves it holds the token by keying an HMAC of the caller's random challenge with it, so nobody gets
 // sent the token (or trusted) just for listening on the port daemon.json names.
-export const proof = (token: string, challenge: string) => createHmac('sha256', token).update(`gh-pr-events info ${challenge}`).digest('hex')
+export const proof = (token: string, challenge: string) => createHmac('sha256', token).update(`pr-events info ${challenge}`).digest('hex')
 
 // The daemon `info` names, if it answers as that daemon; null if it doesn't, or not within a second.
 export async function reachable(info: DaemonInfo | null): Promise<{ version: string; pid: number } | null> {
@@ -75,9 +75,10 @@ export const alive = (pid: number) => {
   }
 }
 
-// Whether pid is a running gh-pr-events daemon (any version), checked by its argv so a reused pid doesn't count.
+// Whether pid is a running pr-events daemon (any 3.x version), checked by its argv so a reused pid doesn't count: the
+// plugin's cache dir (agentic-utils-github/<version>) or a checkout's plugins/github.
 export const isDaemon = (pid: unknown) =>
   Number.isInteger(pid) &&
   (pid as number) > 1 &&
   alive(pid as number) &&
-  /gh-pr-events.*\/server\.[jt]s daemon$/.test(Bun.spawnSync(['ps', '-o', 'command=', '-p', String(pid)]).stdout.toString().trim())
+  /(agentic-utils-github|plugins\/github)\/(.+\/)?server\.[jt]s daemon$/.test(Bun.spawnSync(['ps', '-o', 'command=', '-p', String(pid)]).stdout.toString().trim())

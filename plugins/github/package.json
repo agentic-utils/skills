@@ -1,5 +1,5 @@
 {
-  "name": "gh-pr-events",
+  "name": "agentic-utils-github",
   "private": true,
   "scripts": {
     "build": "bun build src/server.ts --target=bun --minify --outfile server.js",
