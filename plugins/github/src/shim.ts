@@ -133,8 +133,9 @@ async function stream() {
   let connected = false
   for (let attempt = 0; !closing; attempt++) {
     try {
-      // on a reconnect the daemon says what it's watching even if that's nothing, in case it lost something
-      const r = await call('/events', {}, connected ? { 'x-reconnect': '1' } : {})
+      // on a reconnect the daemon says what it's watching if that may be news, even if it's nothing.
+      // timeout: false, or Bun's fetch cuts the stream after 300s.
+      const r = await call('/events', { timeout: false } as RequestInit, connected ? { 'x-reconnect': '1' } : {})
       if (!r.ok || !r.body) throw new Error(`events: ${r.status}`)
       attempt = 0
       connected = true

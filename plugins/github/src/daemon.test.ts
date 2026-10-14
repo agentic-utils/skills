@@ -359,9 +359,14 @@ test(
 
 // A shim on stdio, as Claude Code runs it; script is server.ts or a copy of it.
 function shim(e: Env, env: Record<string, string> = {}, script = server) {
-  const p = Bun.spawn(['bun', script], { env: { ...e.env, ...env }, stdin: 'pipe', stdout: 'pipe', stderr: 'ignore' })
+  const p = Bun.spawn(['bun', script], { env: { ...e.env, ...env }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
   procs.push(p)
   const msgs: any[] = []
+  let logs = ''
+  ;(async () => {
+    const dec = new TextDecoder()
+    for await (const chunk of p.stderr) logs += dec.decode(chunk, { stream: true }) // read to the end, so the pipe never fills
+  })().catch(() => {})
   ;(async () => {
     const dec = new TextDecoder()
     let buf = ''
@@ -387,7 +392,7 @@ function shim(e: Env, env: Record<string, string> = {}, script = server) {
     send({ id, method: 'tools/call', params: { name, arguments: { pr } } })
     return (await reply(id)).result
   }
-  return { p, msgs, send, reply, notes, begin, tool }
+  return { p, msgs, send, reply, notes, begin, tool, logs: () => logs }
 }
 const daemonInfo = (e: Env) => JSON.parse(readFileSync(`${e.dir}/daemon.json`, 'utf8'))
 
@@ -658,6 +663,60 @@ test(
     await Promise.all([a.close(), fresh.close(), back.close()])
   },
   T,
+)
+
+test(
+  'back on the same daemon, "watching" comes only when the subscriptions changed or something was missed',
+  async () => {
+    const e = setup()
+    const d = await daemon(e)
+    await call(d, 'sess-q', 'subscribe_pr', 'o/r#7')
+    const watching = (s: ReturnType<typeof stream>) => s.got.filter(g => g.meta.event === 'watching').map(g => g.content)
+    const a = stream(d, 'sess-q')
+    await until('watching', () => a.got.length)
+    await call(d, 'sess-q', 'subscribe_pr', 'o/r#8') // its own call while connected isn't news later
+    await a.close()
+    const plain = stream(d, 'sess-q', { 'x-reconnect': '1' })
+    await until('connected', () => plain.connected())
+    await Bun.sleep(200)
+    expect(plain.got).toEqual([])
+    await plain.close()
+    await call(d, 'sess-q', 'unsubscribe_pr', 'o/r#8') // changed while away (here by itself, as a stand-in for the daemon)
+    const changed = stream(d, 'sess-q', { 'x-reconnect': '1' })
+    await until('watching', () => changed.got.length)
+    expect(watching(changed)).toEqual(['watching: o/r#7'])
+    await changed.close()
+    const secret = secretOf((await up(e))[0][1])
+    let text = ''
+    await until('queued on disk', async () => {
+      text = await comment(d, secret) // missed while away (once the daemon has seen the stream close)
+      return readFileSync(`${e.dir}/sessions.json`, 'utf8').includes(text)
+    })
+    const missed = stream(d, 'sess-q', { 'x-reconnect': '1' })
+    await until('queued delivery', () => missed.got.length === 2)
+    expect(watching(missed)).toEqual(['watching: o/r#7'])
+    expect(missed.got[1].content).toContain(text)
+    await missed.close()
+  },
+  T,
+)
+
+test(
+  "a shim's event stream stays open past fetch's 5-minute default, with no reconnect and no stray \"watching\"",
+  async () => {
+    const e = setup()
+    const s = shim(e, { CLAUDE_CODE_SESSION_ID: 'sess-long' })
+    s.begin()
+    expect((await s.tool('subscribe_pr', 'o/r#7')).content[0].text).toBe('subscribed: o/r#7')
+    // a fresh session subscribing hears nothing; "watching" here would come only from a reconnect
+    await Bun.sleep(310_000)
+    expect(s.logs()).not.toContain('event stream')
+    expect(s.notes().filter(n => n.meta.event === 'watching')).toEqual([])
+    const info = daemonInfo(e)
+    const text = await comment({ p: s.p, pid: info.pid, port: info.port, token: info.token }, secretOf((await up(e))[0][1]))
+    await until('live delivery', () => s.notes().some(n => n.content.includes(text)))
+  },
+  330_000,
 )
 
 test(
