@@ -26,6 +26,7 @@ const RETRY_MS = Number(process.env.GH_PR_EVENTS_RETRY_MS ?? 30_000) // between 
 const API_TIMEOUT_MS = 60_000
 const RECOVERED = '(recovered after a gap) '
 const REOPEN_HOURS = Number(process.env.GH_PR_EVENTS_REOPEN_HOURS ?? 24) // keep a closed, unmerged PR this long in case it's reopened
+const GRACE_MS = Number(process.env.GH_PR_EVENTS_MERGED_GRACE_MINUTES ?? 60) * 60_000 // keep a merged PR this long for late reviews
 
 type Ev = { content: string; meta: Record<string, string> }
 // A Claude session, known by its CLAUDE_CODE_SESSION_ID, which survives --resume. Streams: its shims' open event streams.
@@ -51,8 +52,9 @@ type Done = { id: string; t: number; r?: true }
 // Per subscribed PR, what a catch-up needs: since: when it last had everything (a live event, or a catch-up's
 // start); gap: set while it's behind, where the catch-up must start from; at: when it was subscribed (nothing older
 // is recovered); gen: bumped each time it falls behind, so a catch-up only closes a gap that didn't reopen while it
-// ran; done: what it already delivered; head: its head sha; closed: when it was closed without merging, if it still is.
-type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number }
+// ran; done: what it already delivered; head: its head sha; closed: when it was closed without merging, if it still is;
+// merged: when it merged (it's watched for late comments until GRACE_MS after).
+type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number; merged?: number }
 
 const actionOf = (p: any) => `pr${p.action}${p.label?.name ?? p.requested_reviewer?.login ?? p.requested_team?.name ?? ''}`
 // An event's identity, the same whether it came live or from the API, so a catch-up never repeats one.
@@ -417,7 +419,7 @@ export async function startDaemon() {
   // Emits only on a change, so a conflict is reported once and again when it clears. onlyBase skips PRs targeting other branches.
   async function recheck(key: string, onlyBase?: string) {
     const first = subs.get(key)
-    if (!first) return
+    if (!first || seen.get(key)?.merged) return // a merged PR has nothing left to conflict with
     const [repo, n] = first.pr.split('#')
     const r = await mergeability(repo, n)
     const s = subs.get(key)
@@ -771,6 +773,12 @@ export async function startDaemon() {
       save()
       emitTo(key, `${text}\n(still watching for ${REOPEN_HOURS}h in case it's reopened)`, meta)
     }
+    // merged: keep watching for late reviews (bots post seconds to minutes after) until closedCheck ends it
+    else if (c) {
+      c.merged = recoveredAt ?? Date.now()
+      save()
+      emitTo(key, `${text}\n(still watching for late comments until ${new Date(c.merged + GRACE_MS).toISOString()})`, meta)
+    }
     // in one step, so whoever is subscribed when it's applied is told, including a subscribe that was queued
     else serial(() => (emitTo(key, text + '\n(unsubscribed automatically)', meta), unsubscribe(key)))
   }
@@ -954,6 +962,7 @@ export async function startDaemon() {
           .map((d: any) => ({ id: d.id, t: d.t, ...(d.r && { r: true as const }) })),
         head: typeof v.head === 'string' ? v.head : undefined,
         closed: Number.isFinite(v.closed) ? v.closed : undefined,
+        merged: Number.isFinite(v.merged) ? v.merged : undefined,
       })
   for (const [id, v] of Object.entries(saved)) {
     if (!validSession.test(id) || !v || typeof v !== 'object' || Array.isArray(v)) continue
@@ -1002,9 +1011,9 @@ export async function startDaemon() {
       }
     })
   }
-  // A PR closed without merging that wasn't reopened in time is done with.
+  // A PR closed without merging that wasn't reopened in time, or merged with its grace window over, is done with.
   const closedCheck = () => {
-    for (const [k, c] of seen)
+    for (const [k, c] of seen) {
       if (c.closed && Date.now() - c.closed > REOPEN_HOURS * 3600_000)
         serial(() => {
           if (!seen.get(k)?.closed || !subs.has(k)) return
@@ -1012,6 +1021,16 @@ export async function startDaemon() {
           emitTo(k, `Still closed after ${REOPEN_HOURS}h; unsubscribed automatically`, { event: 'pull_request', repo, pr: n })
           unsubscribe(k)
         })
+      if (c.merged && Date.now() - c.merged > GRACE_MS)
+        serial(() => {
+          const m = seen.get(k)?.merged
+          const sub = subs.get(k)
+          if (!m || !sub) return
+          const content = `stopped watching ${sub.pr}, merged ${Math.round((Date.now() - m) / 60_000)}m ago`
+          for (const id of sub.sessions) deliver(id, { content, meta: { event: 'channel_error' } })
+          unsubscribe(k)
+        })
+    }
   }
   const timers = [
     setInterval(beat, 4 * 60_000), // the Stop hook wants a beat every 15 min

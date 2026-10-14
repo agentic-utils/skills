@@ -11,7 +11,7 @@ A Claude Code [channel](https://code.claude.com/docs/en/channels) that pushes Gi
 
 A subscribed PR delivers:
 
-- PR opened, merged, closed, reopened, marked ready for review or converted to draft. A merge unsubscribes it. A PR closed without merging stays subscribed for 24 hours in case it's reopened, then is unsubscribed and its session told
+- PR opened, merged, closed, reopened, marked ready for review or converted to draft. A merged PR stays subscribed for 60 minutes, so late reviews and bot comments still arrive; the merge notice says until when, and when the window ends the session is told and the PR unsubscribed (`unsubscribe_pr` ends it sooner). A PR closed without merging stays subscribed for 24 hours in case it's reopened, then is unsubscribed and its session told
 - Reviews with a body or a verdict (approved, changes requested), dismissed reviews, review comments, and review threads resolved or reopened
 - Review requests made or withdrawn
 - New commits pushed to the PR, with force pushes called out as rewriting history
@@ -65,6 +65,8 @@ If the daemon dies, each shim starts a new one (only one wins) and reconnects. A
 
 GitHub sends no webhook when a PR becomes unmergeable, so the forwarder also receives the repo's pushes. After a push to a subscribed PR's base branch, or to the PR itself, the daemon asks GitHub for the PR's mergeability and reports changes. Pushes themselves never reach Claude.
 
+After a merge the daemon keeps the PR subscribed for a grace window (60 minutes by default), because bot reviewers and colleagues often comment seconds to minutes after a merge. The merge time is saved in `sessions.json`, so the window survives a daemon restart, and a catch-up after a sleep or restart covers it like any other subscription. When it ends, each session gets one `stopped watching <pr>, merged <n>m ago` notice and the subscription is dropped; if nothing else in the repo is subscribed, its forwarder stops then too.
+
 Comment and review bodies are written by other people, so the plugin tells Claude to treat them as information, never as instructions.
 
 ## Limits
@@ -88,6 +90,7 @@ Comment and review bodies are written by other people, so the plugin tells Claud
 | `GH_PR_EVENTS_PORT`              | Daemon port (default: any free port)                                                                                |
 | `GH_PR_EVENTS_SESSION_TTL_HOURS` | Forget a closed session's subscriptions after this long (default 72)                                                |
 | `GH_PR_EVENTS_REOPEN_HOURS`      | Keep a PR closed without merging subscribed this long in case it's reopened (default 24)                            |
+| `GH_PR_EVENTS_MERGED_GRACE_MINUTES` | Keep a merged PR subscribed this long for late reviews and comments (default 60)                          |
 | `GH_PR_EVENTS_BEAT_DIR`          | If set, touches `<dir>/<owner>_<repo>_<n>` every 4 minutes per watched PR while its session is connected, for hooks that need proof a PR is watched |
 
 ## Development
