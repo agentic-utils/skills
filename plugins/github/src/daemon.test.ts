@@ -1167,7 +1167,7 @@ const closedHook = (d: Daemon, secret: string, merged: boolean) =>
   prHook(d, secret, 'closed', { pull_request: { html_url: 'https://github.com/o/r/pull/7', merged, head: { sha: 'eeeeeee5' } } })
 
 test(
-  'a PR closed without merging stays subscribed in case it is reopened, across a restart; a merge unsubscribes',
+  'a PR closed without merging stays subscribed in case it is reopened, across a restart; unsubscribe_pr ends a merged one early',
   async () => {
     const e = setup()
     const d1 = await daemon(e)
@@ -1190,8 +1190,11 @@ test(
     await until('reopen', () => s2.got.some(g => g.content.startsWith('o/r#7: PR reopened by amy')))
     expect(JSON.parse(readFileSync(`${e.dir}/sessions.json`, 'utf8'))['#seen']['o/r#7'].closed).toBeUndefined()
     await closedHook(d2, secretOf(a2), true)
-    await until('merge', () => s2.got.some(g => g.content.includes('(unsubscribed automatically)')))
-    expect(s2.got.find(g => g.content.includes('merged'))!.content.split('\n')[0]).toBe('o/r#7: PR merged by amy')
+    await until('merge', () => s2.got.some(g => g.content.startsWith('o/r#7: PR merged by amy')))
+    expect(s2.got.find(g => g.content.includes('merged'))!.content.split('\n')[2]).toMatch(/^\(still watching for late comments until \d{4}-\d\d-\d\dT[\d:.]+Z\)$/)
+    await Bun.sleep(300)
+    expect(running(e).length).toBe(1) // the 60 min window keeps the forwarder
+    expect((await call(d2, 'sess-close', 'unsubscribe_pr', 'o/r#7')).text).toBe('subscribed: none')
     await until('forwarder stopped', () => running(e).length === 0)
     await s2.close()
   },
@@ -1217,4 +1220,67 @@ test(
     await s.close()
   },
   T,
+)
+
+const reviewCommentHook = (d: Daemon, secret: string, id: number) =>
+  hook(d, secret, 'pull_request_review_comment', {
+    action: 'created',
+    repository: { full_name: 'o/r' },
+    sender: { login: 'gemini' },
+    pull_request: { number: 7 },
+    comment: { id, path: 'a.ts', line: 3, html_url: `https://github.com/o/r/pull/7#r${id}`, body: `late ${id}`, created_at: new Date().toISOString() },
+  })
+
+test(
+  'a merged PR still delivers late review comments, then its window ends with one notice and its forwarder stops',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_MERGED_GRACE_MINUTES: '0.1' }) // 6s, checked every 5s
+    const d = await daemon(e)
+    const s = stream(d, 'sess-grace')
+    await call(d, 'sess-grace', 'subscribe_pr', 'o/r#7')
+    const [[, args]] = await up(e)
+    await closedHook(d, secretOf(args), true)
+    await reviewCommentHook(d, secretOf(args), 901)
+    await until('late review comment', () => s.got.some(g => g.content.includes('late 901')))
+    await until('window over', () => errors(s).length, 20_000)
+    await Bun.sleep(5500) // another check: still only one notice
+    expect(s.got.map(g => g.content.split('\n')[0])).toEqual([
+      'o/r#7: PR merged by amy',
+      'o/r#7: Review comment by gemini on a.ts:3',
+      expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/),
+    ])
+    expect(errors(s).length).toBe(1)
+    await until('forwarder stopped', () => running(e).length === 0)
+    expect((await call(d, 'sess-grace', 'unsubscribe_pr', 'o/r#7')).text).toBe('subscribed: none')
+    await s.close()
+  },
+  T,
+)
+
+test(
+  "a merged PR's window survives a restart, and the catch-up covers it",
+  async () => {
+    const e = setup({ GH_PR_EVENTS_MERGED_GRACE_MINUTES: '0.25' }) // 15s
+    const d1 = await daemon(e)
+    await call(d1, 'sess-grace2', 'subscribe_pr', 'o/r#7')
+    const [[f1, a1]] = await up(e)
+    await closedHook(d1, secretOf(a1), true)
+    await until('merged saved', () => JSON.parse(readFileSync(`${e.dir}/sessions.json`, 'utf8'))['#seen']['o/r#7']?.merged)
+    d1.p.kill('SIGTERM')
+    await d1.p.exited
+    // a comment posted while no daemon ran
+    quietPr(e, 'eeeeeee5')
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(902, new Date().toISOString())])
+    const d2 = await daemon(e)
+    const [, a2] = await newForwarder(e, f1)
+    const s = stream(d2, 'sess-grace2')
+    await until('recovered comment', () => recovered(s).some(g => g.content.includes('hello 902')))
+    await reviewCommentHook(d2, secretOf(a2), 903)
+    await until('late review comment', () => s.got.some(g => g.content.includes('late 903')))
+    await until('window over', () => errors(s).length, 30_000)
+    expect(errors(s).map(g => g.content)).toEqual([expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/)])
+    await until('forwarder stopped', () => running(e).length === 0)
+    await s.close()
+  },
+  60_000,
 )

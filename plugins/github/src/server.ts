@@ -13,8 +13,10 @@
 //   than the TTL) subscribes to a PR in it; one that exits (as gh-webhook does whenever its connection drops) is
 //   restarted, and its subscriptions dropped only after 10 failed restarts in a row;
 // - a session gets every event for its PRs: live while connected, queued (up to 100) while not;
-// - a merged PR is unsubscribed at once; one closed without merging stays subscribed for the reopen window (24h)
-//   and is unsubscribed, its sessions told, if it isn't reopened in time;
+// - a merged PR stays subscribed for the grace window (60 min) so late reviews and bot comments still arrive, then
+//   is unsubscribed, its sessions told; one closed without merging stays subscribed for the reopen window (24h) and
+//   is unsubscribed, its sessions told, if it isn't reopened in time; both windows survive a restart and are
+//   covered by catch-ups, and a forwarder kept only for such a PR stops when its window ends;
 // - nothing is lost to a gap, while the machine slept (a 5s timer firing over 30s late), a forwarder was down, or no
 //   daemon ran: the gap opens at the last moment each PR had everything, and live events don't close it; once the
 //   forwarder is back, each PR is caught up from GitHub's API (issue events, comments, review comments, reviews,
@@ -38,6 +40,7 @@
 //      ~/.claude/state/pr-events), GH_PR_EVENTS_PORT (daemon port, default: any free port),
 //      GH_PR_EVENTS_SESSION_TTL_HOURS (forget a closed session after this long, default 72),
 //      GH_PR_EVENTS_REOPEN_HOURS (keep a PR closed without merging subscribed this long, default 24),
+//      GH_PR_EVENTS_MERGED_GRACE_MINUTES (keep a merged PR subscribed this long for late comments, default 60),
 //      GH_PR_EVENTS_BEAT_DIR - if set, touch <dir>/<owner>_<repo>_<n> every few minutes per watched PR
 //      (lets a Stop hook check a PR is still being watched), GH_PR_EVENTS_FORWARDER and GH_PR_EVENTS_GH (tests only: stand-ins for gh-webhook and gh),
 //      GH_PR_EVENTS_GAP_MS and GH_PR_EVENTS_RETRY_MS (tests only: how late the 5s timer must fire to count as a
