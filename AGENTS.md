@@ -9,7 +9,8 @@ This repo is a Claude Code plugin marketplace. Each plugin lives under `plugins/
   marketplace.json              # Marketplace manifest — lists all plugins
 plugins/
   <plugin-name>/
-    plugin.json                 # Plugin metadata (includes version)
+    .claude-plugin/
+      plugin.json               # Plugin manifest (includes version); Claude Code ignores a plugin.json anywhere else
     README.md                   # Required — describes the plugin and its skills
     skills/
       <skill-name>/
@@ -20,7 +21,7 @@ plugins/
 
 ## Creating a Plugin
 
-1. Create `plugins/<plugin-name>/plugin.json` with `"name": "agentic-utils-<plugin-name>"`, so skills show as `/agentic-utils-<plugin-name>:<skill>` and their source is obvious
+1. Create `plugins/<plugin-name>/.claude-plugin/plugin.json` with `"name": "agentic-utils-<plugin-name>"`, so skills show as `/agentic-utils-<plugin-name>:<skill>` and their source is obvious
 2. Add an entry in `.claude-plugin/marketplace.json` (required — plugin will not appear in the marketplace otherwise)
 3. Add skills under `plugins/<plugin-name>/skills/<skill-name>/SKILL.md`
 4. Write a `README.md` (required — see below)
@@ -86,7 +87,7 @@ A version is **not published** until both files agree and the change is on `orig
 
 For every release, in the same commit:
 
-1. Bump `plugins/<plugin-name>/plugin.json` → `version`
+1. Bump `plugins/<plugin-name>/.claude-plugin/plugin.json` → `version`
 2. Bump `.claude-plugin/marketplace.json` → matching plugin entry's `version` (must match `plugin.json` exactly)
 3. Commit with a message describing the user-visible change
 4. Push to `origin/main`
@@ -95,7 +96,7 @@ Verify after pushing:
 
 ```bash
 # both should print the same version
-jq -r '.version' plugins/<plugin-name>/plugin.json
+jq -r '.version' plugins/<plugin-name>/.claude-plugin/plugin.json
 jq -r ".plugins[] | select(.name==\"<plugin-name>\") | .version" .claude-plugin/marketplace.json
 ```
 
