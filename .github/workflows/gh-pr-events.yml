@@ -1,0 +1,27 @@
+name: gh-pr-events
+
+on:
+  pull_request:
+    paths: ['plugins/gh-pr-events/**', '.github/workflows/gh-pr-events.yml']
+  push:
+    branches: [main]
+    paths: ['plugins/gh-pr-events/**', '.github/workflows/gh-pr-events.yml']
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: plugins/gh-pr-events
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10 # the build check compares minified output, which changes between Bun versions
+      - run: bun test
+      # server.js is what the plugin runs, so it must match the source
+      - run: bun run build && git diff --exit-code server.js
