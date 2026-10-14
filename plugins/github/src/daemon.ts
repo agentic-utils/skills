@@ -119,7 +119,8 @@ export async function startDaemon() {
   let url = '' // the webhook receiver's, set once elected
   let stopped = false // once stop() has saved for the last time, nothing else may save or deliver
   let quarantined = false // sessions.json was unreadable at start: every session is told on its first connect
-  const told = new Set<string>() // sessions that have connected to this daemon at least once
+  // sessions that have connected to this daemon at least once, with what they watched when their last stream ended
+  const told = new Map<string, string>()
   const hours = `${Math.round(ttlMs / 3600_000)}h`
   // Only the daemon daemon.json names may write state or deliver: a stale one would clobber its successor's.
   const owned = () => {
@@ -655,7 +656,7 @@ export async function startDaemon() {
         s.expired = { prs, at: now }
         log(`forgot session ${id}'s subscriptions, unseen for ${hours}`)
       }
-      if (!s.expired) sessions.delete(id)
+      if (!s.expired) (sessions.delete(id), told.delete(id))
     }
     save()
     armIdle()
@@ -779,14 +780,19 @@ export async function startDaemon() {
   function events$(id: string, req: Request) {
     const s = session(id)
     const enc = new TextEncoder()
+    const watched = () => [...s.subs.values()].join(', ')
+    let keepAlive: Timer | undefined
     const closed = () => {
+      clearInterval(keepAlive)
       s.streams.delete(send)
+      told.set(id, watched()) // its own subscribe_pr calls while connected aren't news when it reconnects
       s.lastSeen = Date.now()
       if (s.ephemeral && !s.streams.size)
         serial(() => {
           if (s.streams.size) return
           for (const k of [...s.subs.keys()]) unsubscribe(k, id)
           sessions.delete(id)
+          told.delete(id)
         })
       save()
       armIdle()
@@ -804,15 +810,25 @@ export async function startDaemon() {
           }
         }
         ctrl.enqueue(enc.encode(': connected\n\n'))
+        // Bun's fetch drops a stream silent for 300s (a 3.0.0 shim doesn't turn that off), and Bun.serve one silent for 60s
+        keepAlive = setInterval(() => {
+          try {
+            ctrl.enqueue(enc.encode(': keep-alive\n\n'))
+          } catch {
+            clearInterval(keepAlive)
+          }
+        }, 30_000)
         s.streams.add(send)
         s.lastSeen = Date.now()
         clearTimeout(idle)
         if (quarantined && !told.has(id))
           send({ content: "pr-events couldn't read its saved subscriptions; if this session had any, call subscribe_pr again", meta: { event: 'channel_error' } })
-        told.add(id)
-        const watching = [...s.subs.values()]
-        // "none" only on a reconnect, so a new session isn't woken just to hear it watches nothing
-        if (watching.length || req.headers.get('x-reconnect')) send({ content: `watching: ${watching.join(', ') || 'none'}`, meta: { event: 'watching' } })
+        const watching = watched()
+        // First connect to this daemon: "none" only on a reconnect, so a new session isn't woken just to hear it
+        // watches nothing. Back on the same daemon: only if its subscriptions changed or it missed something.
+        const news = told.has(id) ? told.get(id) !== watching || s.pending.length || s.dropped || s.expired : watching || req.headers.get('x-reconnect')
+        if (news) send({ content: `watching: ${watching || 'none'}`, meta: { event: 'watching' } })
+        told.set(id, watching)
         if (s.expired) {
           send({
             content: `pr-events forgot this session's subscriptions after ${hours} away: ${s.expired.prs.join(', ')}. Call subscribe_pr again to resume`,
