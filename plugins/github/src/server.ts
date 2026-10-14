@@ -4,7 +4,7 @@
 // Claude Code spawns `server.js` per session as a tiny stdio shim (shim.ts). GitHub allows one `gh webhook forward`
 // per repo, so the shims share one daemon (`server.js daemon`, daemon.ts) on localhost, which any shim starts if
 // none answers. The daemon gives each repo with a subscribed PR one forwarder (a GitHub-hosted relay; needs repo
-// admin), verifies every delivery's HMAC, and sends each event to the sessions subscribed to its PR (events.ts turns
+// admin, and only one may exist per repo) or, where GitHub refuses one, polls the PR API instead, verifies every delivery's HMAC, and sends each event to the sessions subscribed to its PR (events.ts turns
 // payloads into summaries). It keeps subscriptions per Claude session id, which --resume keeps, and queues events
 // for sessions that aren't connected. Opt-in only: nothing emits for a PR until a session calls subscribe_pr for it.
 //
@@ -12,6 +12,11 @@
 // - each repo has at most one forwarder, running exactly while some live session (connected, or closed for less
 //   than the TTL) subscribes to a PR in it; one that exits (as gh-webhook does whenever its connection drops) is
 //   restarted, and its subscriptions dropped only after 10 failed restarts in a row;
+// - a repo whose forward GitHub refuses (another forward holds it, or no admin) is polled instead: the subscription
+//   still succeeds, its sessions are told once, each PR is caught up through the catch-up path every 60s (a
+//   conditional request first, so an unchanged PR costs a 304 and nothing more; GitHub's X-Poll-Interval or
+//   Retry-After lengthens the wait), and the forward is retried every 5 min, switching back to live with a catch-up
+//   from the last poll once it starts; polling stops with the repo's last subscription;
 // - a session gets every event for its PRs: live while connected, queued (up to 100) while not;
 // - a merged PR stays subscribed for the grace window (60 min) so late reviews and bot comments still arrive, then
 //   is unsubscribed, its sessions told; one closed without merging stays subscribed for the reopen window (24h) and
@@ -41,6 +46,8 @@
 //      GH_PR_EVENTS_SESSION_TTL_HOURS (forget a closed session after this long, default 72),
 //      GH_PR_EVENTS_REOPEN_HOURS (keep a PR closed without merging subscribed this long, default 24),
 //      GH_PR_EVENTS_MERGED_GRACE_MINUTES (keep a merged PR subscribed this long for late comments, default 60),
+//      GH_PR_EVENTS_POLL_SECONDS (how often a repo that can't be forwarded is polled, default 60),
+//      GH_PR_EVENTS_FORWARD_RETRY_MS (tests only: how often a polled repo's forward is retried, default 300000),
 //      GH_PR_EVENTS_BEAT_DIR - if set, touch <dir>/<owner>_<repo>_<n> every few minutes per watched PR
 //      (lets a Stop hook check a PR is still being watched), GH_PR_EVENTS_FORWARDER and GH_PR_EVENTS_GH (tests only: stand-ins for gh-webhook and gh),
 //      GH_PR_EVENTS_GAP_MS and GH_PR_EVENTS_RETRY_MS (tests only: how late the 5s timer must fire to count as a

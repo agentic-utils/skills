@@ -49,7 +49,7 @@ Without either flag the tools still work, but Claude Code silently drops every e
 
 - [Bun](https://bun.sh) (runs the bundled `server.js`)
 - [gh](https://cli.github.com) logged in, with the [gh-webhook](https://github.com/cli/gh-webhook) extension
-- Admin on each repo whose PRs you subscribe to
+- Admin on a repo for live events; without it (or when someone else holds the repo's forward) its PRs are polled
 
 ## How it works
 
@@ -63,6 +63,8 @@ If the daemon dies, each shim starts a new one (only one wins) and reconnects. A
 
 `gh webhook forward` exits whenever its connection to GitHub drops (a sleep, a network change), and GitHub deletes its webhook, delivery log included, as soon as the connection dies. So the daemon restarts a forwarder that exits, retrying for about six minutes before it drops the repo's subscriptions and tells their sessions. It also watches for sleeps: a 5-second timer that fires more than 30 seconds late means the machine was asleep, and the daemon restarts every forwarder. Each of these, and a new daemon starting, opens a gap for the repo's PRs at the last moment each had all its events; live events that arrive meanwhile don't close it. Once the forwarder is back, the daemon catches each PR up from GitHub's API under your `gh` login, from the start of its gap: issue events (merged, closed, reopened, draft changes, labels, review requests, auto-merge, the merge queue), comments, review comments, reviews, new commits (including force pushes, named after the head commit's author) and finished CI, including workflow runs started during the gap. These go through the same path as live webhooks, prefixed `(recovered after a gap)`. Each PR keeps its recently delivered events in `sessions.json`, so a catch-up never repeats one, whether it arrived live, recovered, or before a restart. Live events are never dropped as repeats of each other; a recovered PR action counts as the live one of the same kind closest to it in time, within two minutes. If a catch-up still fails after five tries, the PR's sessions are told which PR, from when, and why, and the gap stays open for the next restart to retry.
 
+GitHub allows one `gh webhook forward` per repo, and only for admins. When it refuses one (a colleague or another machine already holds the repo's forward, or you aren't admin), the subscription still succeeds and the repo is polled instead: the session is told once (`pr-events: polling owner/repo#n every 60s (forward unavailable: <reason>)`), and every 60 seconds each PR is caught up through the same path as after a gap, with the same summaries and no repeats. Each poll first asks GitHub whether the PR or its head's CI changed, with a conditional request (ETag), so an unchanged PR costs a 304 that doesn't count against the rate limit; a full catch-up runs anyway every five minutes. If GitHub sends `X-Poll-Interval` or `Retry-After`, polling waits that long. The forward is retried every five minutes, and once it starts the repo switches back to live events, catching up from the last poll first.
+
 GitHub sends no webhook when a PR becomes unmergeable, so the forwarder also receives the repo's pushes. After a push to a subscribed PR's base branch, or to the PR itself, the daemon asks GitHub for the PR's mergeability and reports changes. Pushes themselves never reach Claude.
 
 After a merge the daemon keeps the PR subscribed for a grace window (60 minutes by default), because bot reviewers and colleagues often comment seconds to minutes after a merge. The merge time is saved in `sessions.json`, so the window survives a daemon restart, and a catch-up after a sleep or restart covers it like any other subscription. When it ends, each session gets one `stopped watching <pr>, merged <n>m ago` notice and the subscription is dropped; if nothing else in the repo is subscribed, its forwarder stops then too.
@@ -74,7 +76,7 @@ Comment and review bodies are written by other people, so the plugin tells Claud
 - What a sleep, a dead forwarder or a stopped daemon missed is recovered from the PR API, which doesn't cover everything a webhook would: dismissed reviews, resolved review threads, and the reasons auto-merge was switched off or a PR left the merge queue are not recovered. CI is recovered on the PR's head before and after the gap, plus any workflow run started during it; check suites from other apps on a head pushed and replaced within the gap are not.
 - If a dying forwarder hands over a PR action (a label, say) after a catch-up has already recovered it, it arrives twice. Live PR actions are never dropped as repeats, so that a real repeat is never lost.
 - Catching up needs gh 2.48 or later (`gh api --slurp`); with an older gh the daemon logs it, and each catch-up tells its sessions so.
-- A forward to the same repo from outside the daemon (another machine, or a manual `gh webhook forward`) blocks it: subscribing there returns an error.
+- A repo shared with someone else's forward (another machine, a colleague, or a manual `gh webhook forward`), or one you aren't admin on, is polled: events arrive up to about a minute late (longer if GitHub asks for a longer poll interval), and only what the catch-up recovers (see above) arrives at all.
 - The webhook secret is passed to `gh-webhook` on its command line, so other users on a shared machine can read it with `ps`. Use this on single-user machines.
 - If a forwarder can't be restarted for about six minutes (offline for that long, say), its subscriptions are dropped and their sessions told; Claude has to call `subscribe_pr` again.
 - GitHub computes mergeability lazily: the daemon retries for about 15s after a push, so a slow recompute can miss a conflict.
@@ -91,6 +93,7 @@ Comment and review bodies are written by other people, so the plugin tells Claud
 | `GH_PR_EVENTS_SESSION_TTL_HOURS` | Forget a closed session's subscriptions after this long (default 72)                                                |
 | `GH_PR_EVENTS_REOPEN_HOURS`      | Keep a PR closed without merging subscribed this long in case it's reopened (default 24)                            |
 | `GH_PR_EVENTS_MERGED_GRACE_MINUTES` | Keep a merged PR subscribed this long for late reviews and comments (default 60)                          |
+| `GH_PR_EVENTS_POLL_SECONDS`      | How often a repo that can't be forwarded is polled (default 60)                                                     |
 | `GH_PR_EVENTS_BEAT_DIR`          | If set, touches `<dir>/<owner>_<repo>_<n>` every 4 minutes per watched PR while its session is connected, for hooks that need proof a PR is watched |
 
 ## Development

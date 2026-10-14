@@ -26,6 +26,12 @@ const RETRY_MS = Number(process.env.GH_PR_EVENTS_RETRY_MS ?? 30_000) // between 
 const API_TIMEOUT_MS = 60_000
 const RECOVERED = '(recovered after a gap) '
 const REOPEN_HOURS = Number(process.env.GH_PR_EVENTS_REOPEN_HOURS ?? 24) // keep a closed, unmerged PR this long in case it's reopened
+const POLL_MS = Number(process.env.GH_PR_EVENTS_POLL_SECONDS ?? 60) * 1000 // a repo we can't forward is polled this often
+const FORWARD_RETRY_MS = Number(process.env.GH_PR_EVENTS_FORWARD_RETRY_MS ?? 5 * 60_000) // and its forward retried this often (env: tests only)
+const SWEEP_MS = 5 * 60_000 // a polled PR is caught up in full this often even when its probes saw no change
+// GitHub refusing the forward: one is allowed per repo and someone else holds it, or we're not admin
+const TAKEN = /already exists/i
+const NO_ADMIN = /HTTP 40[34]|Not Found|admin|Resource not accessible/i
 const GRACE_MS = Number(process.env.GH_PR_EVENTS_MERGED_GRACE_MINUTES ?? 60) * 60_000 // keep a merged PR this long for late reviews
 
 type Ev = { content: string; meta: Record<string, string> }
@@ -44,7 +50,11 @@ type Session = {
 }
 type Sub = { pr: string; sessions: Set<string>; conflictBase?: string } // conflictBase: set while the PR conflicts with it
 // A repo's forwarder from the first subscribe on: `ready` settles once it has started (null) or failed (the error).
-type Fwd = { p?: Subprocess<'ignore', 'ignore', 'pipe'>; ready: Promise<string | null>; up: boolean; cancelled: boolean }
+// refused: why GitHub refused the forward, if it did.
+type Fwd = { p?: Subprocess<'ignore', 'ignore', 'pipe'>; ready: Promise<string | null>; up: boolean; cancelled: boolean; refused?: string }
+// A repo polled because it can't be forwarded: when it's next due, when to retry the forward, when its PRs were last
+// caught up in full, and why it's polled.
+type Poll = { due: number; retry: number; swept: number; why: string; busy?: boolean }
 // One delivered event, kept so a catch-up doesn't repeat it: its id, when it happened, and whether a catch-up sent it.
 // A PR action (label, review request, draft...) has no id GitHub repeats in its issue events, so live ones are kept
 // as `pr<action><subject>` and matched by time instead.
@@ -109,6 +119,10 @@ export async function startDaemon() {
   const seen = new Map<string, Seen>() // per key in subs, persisted with the sessions
   const behind = new Set<string>() // repos whose forwarder was down or cut off: caught up once it's back
   const restarts = new Map<string, number>() // repo -> failed restarts in a row
+  const polled = new Map<string, Poll>() // repos GitHub won't forward to us, polled instead
+  // ponytail: never pruned (a few short strings per PR head polled); prune with the PR if polling gets heavy use
+  const etags = new Map<string, string>() // API path -> its last ETag, for conditional polls
+  const pollFails = new Map<string, number>() // key -> failed polls in a row
   const waits = new Set<Timer>() // pending restarts and catch-up retries, cleared by stop()
   const later = (fn: () => unknown, ms: number) => {
     const t = setTimeout(() => (waits.delete(t), halting || fn()), ms)
@@ -212,6 +226,7 @@ export async function startDaemon() {
       subs.delete(k)
       seen.delete(k)
     }
+    polled.delete(repo)
     save()
     armIdle()
   }
@@ -259,17 +274,20 @@ export async function startDaemon() {
       track(p.pid, p.exited)
       // read stderr for as long as it runs: a full, unread pipe would block the forwarder
       let firstLine = ''
+      let all = ''
       const stderrDone = (async () => {
         const dec = new TextDecoder()
         for await (const chunk of p.stderr) {
           const text = dec.decode(chunk, { stream: true })
           firstLine ||= text.split('\n')[0]
+          all += text
           log(`[${repo}]`, text.trimEnd())
         }
       })().catch(() => {})
       if ((await Promise.race([p.exited, Bun.sleep(3000).then(() => null)])) !== null) {
         if (f.cancelled) return cancelledMsg // stopped on purpose during its start
         await stderrDone
+        f.refused = TAKEN.test(all) ? 'another forward holds the repo' : NO_ADMIN.test(all) ? 'no admin on the repo' : undefined
         return `gh webhook forward failed for ${repo}: ${firstLine}`
       }
       f.up = true
@@ -291,10 +309,17 @@ export async function startDaemon() {
       serial(() => {
         if (forwarders.get(repo) !== f) return
         if (!err) {
+          // back from polling: catch up from the last poll, which the ids keep from repeating anything
+          if (polled.delete(repo)) {
+            behind.add(repo)
+            for (const k of inRepo(repo)) tell(k, `pr-events: forwarding ${subs.get(k)!.pr} live again`)
+          }
           if (behind.delete(repo)) for (const k of inRepo(repo)) catchUp(k).catch(log)
           return
         }
         forwarders.delete(repo)
+        if (polled.has(repo)) return // keeps polling; the forward is retried later
+        if (f.refused) return poll(repo, f.refused)
         // a restart that failed (offline just after waking, say) keeps its subscriptions and tries again
         if (behind.has(repo)) return restartLater(repo, err)
         // a failed first start takes its waiting subscriptions with it; each subscriber gets the error as its reply
@@ -345,6 +370,20 @@ export async function startDaemon() {
     )
   }
 
+  // Called inside serial(). A repo GitHub won't forward to us is caught up from the API every POLL_MS instead, and
+  // its forward retried every FORWARD_RETRY_MS.
+  function poll(repo: string, why: string) {
+    behind.delete(repo)
+    restarts.delete(repo)
+    if (polled.has(repo)) return
+    polled.set(repo, { due: Date.now(), retry: Date.now() + FORWARD_RETRY_MS, swept: 0, why })
+    for (const k of inRepo(repo)) tell(k, pollingMsg(subs.get(k)!.pr, why))
+  }
+  const pollingMsg = (pr: string, why: string) => `pr-events: polling ${pr} every ${POLL_MS / 1000}s (forward unavailable: ${why})`
+  const tell = (key: string, content: string) => {
+    for (const id of subs.get(key)?.sessions ?? []) deliver(id, { content, meta: { event: 'polling' } })
+  }
+
   // Doesn't wait: the next start for the repo waits for the exit instead.
   function stopForwarder(repo: string) {
     const f = forwarders.get(repo)
@@ -376,7 +415,8 @@ export async function startDaemon() {
     for (const [id, s] of sessions) {
       if (!s.beatDir || !s.streams.size) continue
       for (const [k, pr] of s.subs) {
-        if (!forwarders.get(k.split('#')[0])?.up) continue
+        const repo = k.split('#')[0]
+        if (!forwarders.get(repo)?.up && !polled.has(repo)) continue
         const f = `${s.beatDir}/${beatName(pr)}`
         try {
           mkdirSync(s.beatDir, { recursive: true })
@@ -439,17 +479,76 @@ export async function startDaemon() {
 
   // Throws on any failure, or after a minute, so a catch-up that didn't see everything isn't recorded as done.
   // list: every page, flattened. raw: the response with its headers, one page only.
-  async function api(path: string, mode?: 'list' | 'raw'): Promise<any> {
+  async function ghApi(args: string[], path: string) {
     if (ghOld) throw new Error(ghOld)
-    const args = mode === 'list' ? ['--paginate', '--slurp'] : mode === 'raw' ? ['-i'] : []
     const p = Bun.spawn([process.env.GH_PR_EVENTS_GH ?? 'gh', 'api', ...args, path], { stdout: 'pipe', stderr: 'pipe', timeout: API_TIMEOUT_MS })
     const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
     if (p.signalCode) throw new Error(`gh api ${path} timed out`)
-    if (code !== 0) throw new Error(`gh api ${path} failed: ${err.trim().split('\n')[0] || `exit ${code}`}`)
+    return { out, code, why: `gh api ${path} failed: ${err.trim().split('\n')[0] || `exit ${code}`}` }
+  }
+  async function api(path: string, mode?: 'list' | 'raw'): Promise<any> {
+    const { out, code, why } = await ghApi(mode === 'list' ? ['--paginate', '--slurp'] : mode === 'raw' ? ['-i'] : [], path)
+    if (code !== 0) throw new Error(why)
     if (mode === 'list') return JSON.parse(out).flat()
     if (mode !== 'raw') return JSON.parse(out)
     const i = out.search(/\r?\n\r?\n/)
     return { headers: out.slice(0, i), body: JSON.parse(out.slice(i).trim()) }
+  }
+
+  // Whether the resource changed since the last call, by a conditional GET: GitHub answers an unchanged one with a 304,
+  // which doesn't count against the rate limit (gh exits 1 on it, headers still printed). wait: how long GitHub asks
+  // us to hold off (X-Poll-Interval, or Retry-After on a refusal), in ms.
+  // The new ETag is only kept once the caller has caught up (keep()), so a failed catch-up is retried next poll.
+  async function changed(path: string): Promise<{ changed: boolean; wait: number; keep: () => void }> {
+    const etag = etags.get(path)
+    const { out, code, why } = await ghApi(['-i', ...(etag ? ['-H', `If-None-Match: ${etag}`] : [])], path)
+    const head = out.split(/\r?\n\r?\n/)[0]
+    const h = (name: string) => head.match(new RegExp(`^${name}:\\s*(.+?)\\s*$`, 'im'))?.[1]
+    const wait = Math.max(Number(h('x-poll-interval')) || 0, Number(h('retry-after')) || 0) * 1000
+    const status = Number(head.match(/^HTTP\/\S+ (\d+)/)?.[1])
+    if (status === 304) return { changed: false, wait, keep: () => {} }
+    if (code !== 0) throw Object.assign(new Error(why), { wait })
+    const e = h('etag')
+    return { changed: true, wait, keep: () => e && etags.set(path, e) }
+  }
+
+  // One poll of a PR in a polled repo: probes the PR and its head's CI conditionally, and catches up only if either
+  // changed (or a full sweep is due, or a gap is open). Returns how long GitHub asked us to wait.
+  async function pollPr(key: string, sweep: boolean): Promise<number> {
+    const c = seen.get(key)
+    const sub = subs.get(key)
+    if (!c || !sub) return 0
+    const [repo, n] = sub.pr.split('#')
+    try {
+      const probes = await Promise.all([`repos/${repo}/pulls/${n}`, ...(c.head ? [`repos/${repo}/commits/${c.head}/check-suites`] : [])].map(changed))
+      if (sweep || c.gap !== undefined || probes.some(p => p.changed)) await catchUp(key, 0, true)
+      probes.forEach(p => p.keep())
+      pollFails.delete(key)
+      return Math.max(0, ...probes.map(p => p.wait))
+    } catch (e: any) {
+      const fails = (pollFails.get(key) ?? 0) + 1
+      pollFails.set(key, fails)
+      log(`poll of ${sub.pr} failed (${e?.message ?? e})`)
+      if (fails === 5) emitTo(key, `pr-events could not poll it 5 times in a row: ${e?.message ?? e}`, { event: 'channel_error' })
+      return e?.wait ?? 0
+    }
+  }
+  const pollCheck = () => {
+    const now = Date.now()
+    for (const [repo, p] of polled) {
+      if (now >= p.retry) {
+        p.retry = now + FORWARD_RETRY_MS
+        serial(() => polled.has(repo) && !forwarders.has(repo) && ensureForwarder(repo))
+      }
+      if (now < p.due || p.busy) continue
+      p.busy = true
+      const sweep = now - p.swept >= SWEEP_MS
+      if (sweep) p.swept = now
+      Promise.all(inRepo(repo).map(k => pollPr(k, sweep))).then(w => {
+        p.busy = false
+        p.due = Date.now() + Math.max(POLL_MS, ...w)
+      })
+    }
   }
 
   // A PR's issue events back to `after`. The API lists them oldest first only, so this reads the last page first
@@ -468,7 +567,8 @@ export async function startDaemon() {
 
   // Everything that happened on the PR since it last had everything, replayed as the webhooks it missed would have
   // been. A failure leaves the gap open and tries again; the last failure tells the PR's sessions.
-  async function catchUp(key: string, tries = 0): Promise<void> {
+  // polling: a routine poll, whose events aren't marked recovered and whose failure the next poll retries.
+  async function catchUp(key: string, tries = 0, polling = false): Promise<void> {
     const c = seen.get(key)
     const sub = subs.get(key)
     if (!c || !sub) return
@@ -572,7 +672,7 @@ export async function startDaemon() {
         })
       }
       missed.sort((a, b) => a.t.localeCompare(b.t))
-      for (const m of missed) await handle(m.event, m.payload, Date.parse(m.t) || start)
+      for (const m of missed) await handle(m.event, m.payload, Date.parse(m.t) || start, polling)
       c.head = sha
       // fell behind again meanwhile (a second sleep): leave the gap for the catch-up that follows
       if (c.gen === gen) {
@@ -586,6 +686,7 @@ export async function startDaemon() {
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e)
       log(`catch-up for ${sub.pr} failed (${why})`)
+      if (polling) throw e
       if (tries < 4 && !ghOld) return later(() => catchUp(key, tries + 1).catch(log), RETRY_MS)
       // the gap stays open, so the next sleep or restart tries again
       emitTo(key, `pr-events could not recover the events missed since ${new Date(from).toISOString()}: ${why}`, { event: 'channel_error' }) // led by the PR's name
@@ -618,7 +719,9 @@ export async function startDaemon() {
       const e = conflictEv(sub, sub.conflictBase, true)
       deliver(id, { ...e, content: label(sub, e.content) })
     }
-    return { ready: ensureForwarder(key.split('#')[0]) }
+    const p = polled.get(key.split('#')[0])
+    if (p) deliver(id, { content: pollingMsg(sub.pr, p.why), meta: { event: 'polling' } })
+    return { ready: p ? Promise.resolve(null) : ensureForwarder(key.split('#')[0]) }
   }
 
   // Drops one session's interest, or everyone's when id is omitted (the PR closed). The last one out stops the forwarder.
@@ -633,8 +736,9 @@ export async function startDaemon() {
     if (sub.sessions.size) return
     subs.delete(key)
     seen.delete(key)
+    pollFails.delete(key)
     const repo = key.split('#')[0]
-    if (!inRepo(repo).length) stopForwarder(repo)
+    if (!inRepo(repo).length) (stopForwarder(repo), polled.delete(repo))
     armIdle()
   }
 
@@ -723,7 +827,7 @@ export async function startDaemon() {
 
   // One event, live (HMAC checked) or recovered by a catch-up (fetched from GitHub's API under the user's gh auth;
   // recoveredAt: when it happened).
-  async function handle(event: string, payload: any, recoveredAt?: number) {
+  async function handle(event: string, payload: any, recoveredAt?: number, polling = false) {
     const recovered = recoveredAt !== undefined
     let e: Event = null
     try {
@@ -764,7 +868,7 @@ export async function startDaemon() {
     if (event === 'pull_request' && payload.action === 'synchronize' && (await forced(repo, payload.before, payload.after))) {
       e.text = e.text.replace('New commits pushed by', 'Force-pushed by').replace('\n', ' (history rewritten)\n')
     }
-    const text = recovered ? RECOVERED + e.text : e.text
+    const text = recovered && !polling ? RECOVERED + e.text : e.text
     const meta = { event, repo, pr: String(e.pr) }
     if (!e.done) emitTo(key, text, meta)
     // closed without merging: it may be reopened, so keep watching for a while (closedCheck ends it)
@@ -1005,6 +1109,7 @@ export async function startDaemon() {
       log(`woke after ~${Math.round(late / 1000)}s asleep; restarting forwarders`)
       for (const repo of new Set([...subs.keys()].map(k => k.split('#')[0]))) {
         fellBehind(repo)
+        if (polled.has(repo)) continue // its next poll catches up
         restarts.delete(repo)
         stopForwarder(repo)
         ensureForwarder(repo)
@@ -1038,6 +1143,7 @@ export async function startDaemon() {
     // a daemon that daemon.json no longer names can't be found by shims, so it only holds webhooks: step aside
     setInterval(() => !owned() && quit('daemon.json names another daemon'), 5000),
     setInterval(() => (sleepCheck(), closedCheck()), TICK_MS),
+    setInterval(pollCheck, Math.min(TICK_MS, POLL_MS)),
   ]
   log(`daemon ${process.pid} ${version} on ${url}`)
   // catching up pages with `gh api --slurp`, which gh 2.48 added

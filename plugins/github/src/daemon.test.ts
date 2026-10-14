@@ -11,9 +11,11 @@ const server = `${import.meta.dir}/server.ts`
 const T = 45_000
 
 // Logs "start <pid> <args>" and "stop <pid>" to $FAKE_LOG; FAKE_FAIL=1 makes it die at once like a refused forward,
-// FAKE_SLOW_EXIT=1 take 3s to exit when told to.
+// as does the file $FAKE_REFUSE while it exists (printing it, as GitHub's refusal), FAKE_SLOW_EXIT=1 take 3s to exit
+// when told to.
 const fakeForwarder = `#!/bin/bash
 if [ -n "$FAKE_FAIL" ]; then echo "fake: forward refused" >&2; exit 1; fi
+if [ -n "$FAKE_REFUSE" ] && [ -f "$FAKE_REFUSE" ]; then cat "$FAKE_REFUSE" >&2; exit 1; fi
 echo "start $$ $*" >> "$FAKE_LOG"
 trap '[ -n "$FAKE_SLOW_EXIT" ] && sleep 3; kill $c 2>/dev/null; echo "stop $$" >> "$FAKE_LOG"; exit 0' INT TERM
 sleep 600 & c=$!
@@ -23,7 +25,8 @@ wait $c
 // status ("ahead"). Anything else is one page served from $FAKE_API/<path with / as _>, query dropped, or a 404:
 // page=N serves <file>@N, and -i names the last page from <file>@last. --slurp wraps the page as GitHub's one-page
 // result, unless FAKE_NO_SLURP makes it an unknown flag, like gh before 2.48. <file>.delay holds the call that many
-// seconds; with FAKE_GH_LOG set, each served call logs "done <path>" there.
+// seconds; with FAKE_GH_LOG set, each served call logs "call <path> inm=<If-None-Match>" and "done <path>" there.
+// <file>.etag is its ETag: -i sends it, and a matching If-None-Match gets a 304 (gh exits 1 on it, like the real one).
 const fakeGh = `#!/bin/bash
 [ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
 for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
@@ -35,9 +38,12 @@ page=$(printf '&%s' "\${path#*\\?}" | sed -n 's/.*&page=\\([0-9]*\\).*/\\1/p')
 [ -f "$f" ] || exit 1
 [ -f "$f.delay" ] && sleep "$(cat "$f.delay")"
 [ -n "$FAKE_GH_LOG" ] && trap 'echo "done $path" >> "$FAKE_GH_LOG"' EXIT
+inm=; for a in "$@"; do case "$a" in "If-None-Match: "*) inm="\${a#If-None-Match: }" ;; esac; done
+[ -n "$FAKE_GH_LOG" ] && echo "call $path inm=$inm" >> "$FAKE_GH_LOG"
+if [ -n "$inm" ] && [ -f "$f.etag" ] && [ "$inm" = "$(cat "$f.etag")" ]; then printf 'HTTP/2.0 304 Not Modified\\r\\nEtag: %s\\r\\n\\r\\n' "$inm"; echo 'gh: HTTP 304' >&2; exit 1; fi
 case " $* " in
   *" --slurp "*) [ -n "$FAKE_NO_SLURP" ] && { echo 'unknown flag: --slurp' >&2; exit 1; }; printf '['; cat "$f"; printf ']' ;;
-  *" -i "*) printf 'HTTP/2.0 200 OK\\r\\n'; [ -f "$f@last" ] && printf 'Link: <https://api.github.com/x?per_page=100&page=%s>; rel="last"\\r\\n' "$(cat "$f@last")"; printf '\\r\\n'; cat "$f" ;;
+  *" -i "*) printf 'HTTP/2.0 200 OK\\r\\n'; [ -f "$f.etag" ] && printf 'Etag: %s\\r\\n' "$(cat "$f.etag")"; [ -f "$f@last" ] && printf 'Link: <https://api.github.com/x?per_page=100&page=%s>; rel="last"\\r\\n' "$(cat "$f@last")"; printf '\\r\\n'; cat "$f" ;;
   *) cat "$f" ;;
 esac
 `
@@ -856,6 +862,7 @@ const quietPr = (e: Env, sha: string) => {
   serve(e, 'repos/o/r/pulls/7', { html_url: 'https://github.com/o/r/pull/7', head: { sha } })
   for (const p of ['repos/o/r/issues/7/events', 'repos/o/r/issues/7/comments', 'repos/o/r/pulls/7/comments', 'repos/o/r/pulls/7/reviews']) serve(e, p, [])
   serve(e, 'repos/o/r/actions/runs', { workflow_runs: [] })
+  serve(e, `repos/o/r/commits/${sha}/check-suites`, { check_suites: [] })
 }
 
 test(
@@ -1283,4 +1290,91 @@ test(
     await s.close()
   },
   60_000,
+)
+
+// ---- polling, when GitHub won't forward a repo to us ----
+
+const TAKEN = 'Error: error creating webhook: HTTP 422: Validation Failed (https://api.github.com/repos/o/r/hooks)\nHook already exists on this repository'
+const NO_ADMIN = 'Error: error creating webhook: HTTP 404: Not Found (https://api.github.com/repos/o/r/hooks)'
+// A daemon whose forwards to o/r are refused with `msg` while $FAKE_REFUSE exists, and a session polling o/r#7.
+async function polling(e: Env, msg: string, sid: string, sha: string) {
+  e.env.FAKE_REFUSE = `${e.api}/../refuse`
+  writeFileSync(e.env.FAKE_REFUSE, msg)
+  quietPr(e, sha)
+  const d = await daemon(e)
+  const s = stream(d, sid)
+  expect((await call(d, sid, 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
+  await until('polling notice', () => s.got.length)
+  await Bun.sleep(50) // comments from here on are newer than the subscription
+  return { d, s }
+}
+const hellos = (s: { got: { content: string }[] }, id: number) => s.got.filter(g => g.content.endsWith(`hello ${id}`)).length
+
+for (const [why, msg] of [
+  ['another forward holds the repo', TAKEN],
+  ['no admin on the repo', NO_ADMIN],
+])
+  test(
+    `a forward refused (${why}) falls back to polling, and events still arrive`,
+    async () => {
+      const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1' })
+      const { s } = await polling(e, msg, 'sess-poll', 'abcdef09')
+      expect(s.got[0]).toEqual({ content: `pr-events: polling o/r#7 every 1s (forward unavailable: ${why})`, meta: { event: 'polling' } })
+      serve(e, 'repos/o/r/issues/7/comments', [apiComment(950, new Date().toISOString())])
+      await until('polled comment', () => hellos(s, 950))
+      await Bun.sleep(2500) // more polls: nothing repeats
+      expect(s.got.map(g => g.content.split('\n')[0])).toEqual([s.got[0].content, 'o/r#7: Comment by amy'])
+      expect(running(e)).toEqual([])
+      await s.close()
+    },
+    T,
+  )
+
+test(
+  'a polled repo switches back to forwarding once the forward is free, without repeats',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', GH_PR_EVENTS_FORWARD_RETRY_MS: '3000' })
+    const { d, s } = await polling(e, TAKEN, 'sess-switch', 'abcdef10')
+    const c960 = apiComment(960, new Date().toISOString())
+    serve(e, 'repos/o/r/issues/7/comments', [c960])
+    await until('polled comment', () => hellos(s, 960))
+    rmSync(e.env.FAKE_REFUSE)
+    const c961 = apiComment(961, new Date().toISOString())
+    serve(e, 'repos/o/r/issues/7/comments', [c960, c961])
+    const [[, args]] = await up(e)
+    await until('live again', () => s.got.some(g => g.content === 'pr-events: forwarding o/r#7 live again'))
+    await until('caught up', () => hellos(s, 961))
+    await commentHook(d, secretOf(args), c961) // a live repeat of what polling already delivered
+    await commentHook(d, secretOf(args), apiComment(962, new Date().toISOString()))
+    await until('live comment', () => hellos(s, 962))
+    await Bun.sleep(2500) // no poll runs any more
+    expect([960, 961, 962].map(id => hellos(s, id))).toEqual([1, 1, 1])
+    expect(recovered(s)).toEqual([])
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'polls are conditional requests, and an unchanged PR answers 304 and produces nothing',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr1"')
+    writeFileSync(`${e.api}/repos_o_r_commits_abcdef11_check-suites.etag`, '"ci1"')
+    const { s } = await polling(e, NO_ADMIN, 'sess-etag', 'abcdef11')
+    const ghLog = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '')
+    const count = (re: RegExp) => ghLog().match(re)?.length ?? 0
+    await until('a conditional probe', () => count(/call repos\/o\/r\/pulls\/7 inm="pr1"/g) && count(/inm="ci1"/g))
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(970, new Date().toISOString())])
+    const fetched = count(/call repos\/o\/r\/issues\/7\/comments/g)
+    const probes = count(/inm="pr1"/g)
+    await until('two more 304s', () => count(/inm="pr1"/g) >= probes + 2)
+    expect(count(/call repos\/o\/r\/issues\/7\/comments/g)).toBe(fetched) // no catch-up behind a 304
+    expect(hellos(s, 970)).toBe(0)
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr2"') // the PR changed
+    await until('polled comment', () => hellos(s, 970))
+    await s.close()
+  },
+  T,
 )
