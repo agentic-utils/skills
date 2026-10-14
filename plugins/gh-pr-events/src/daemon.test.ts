@@ -466,8 +466,9 @@ test(
     const root = mkdtempSync(`${tmpdir()}/gh-pr-events-test-`)
     dirs.push(root)
     cpSync(import.meta.dir, `${root}/gh-pr-events/src`, { recursive: true }) // the daemon check wants gh-pr-events in its path
-    const meta = JSON.parse(readFileSync(`${import.meta.dir}/../plugin.json`, 'utf8'))
-    writeFileSync(`${root}/gh-pr-events/plugin.json`, JSON.stringify({ ...meta, version: '99.0.0' }))
+    const meta = JSON.parse(readFileSync(`${import.meta.dir}/../.claude-plugin/plugin.json`, 'utf8'))
+    mkdirSync(`${root}/gh-pr-events/.claude-plugin`, { recursive: true })
+    writeFileSync(`${root}/gh-pr-events/.claude-plugin/plugin.json`, JSON.stringify({ ...meta, version: '99.0.0' }))
 
     const d1 = await daemon(e)
     const t0 = Date.now()
@@ -497,7 +498,7 @@ test(
   async () => {
     const e = setup()
     writeFileSync(`${e.dir}/latest.json`, JSON.stringify({ version: '99.0.0' }))
-    const own = JSON.parse(readFileSync(`${import.meta.dir}/../plugin.json`, 'utf8')).version
+    const own = JSON.parse(readFileSync(`${import.meta.dir}/../.claude-plugin/plugin.json`, 'utf8')).version
     const s = shim(e, { CLAUDE_CODE_SESSION_ID: 'sess-rb' })
     const t0 = Date.now()
     s.begin()
@@ -515,7 +516,7 @@ test(
   'a latest.json naming this version (even with a stale path from 2.0.0) holds nothing up',
   async () => {
     const e = setup()
-    const own = JSON.parse(readFileSync(`${import.meta.dir}/../plugin.json`, 'utf8')).version
+    const own = JSON.parse(readFileSync(`${import.meta.dir}/../.claude-plugin/plugin.json`, 'utf8')).version
     writeFileSync(`${e.dir}/latest.json`, JSON.stringify({ version: own, path: '/nonexistent/broken/server.js' }))
     const s = shim(e, { CLAUDE_CODE_SESSION_ID: 'sess-same' })
     const t0 = Date.now()

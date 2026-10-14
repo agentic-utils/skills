@@ -4,7 +4,7 @@
 import { spawn } from 'node:child_process'
 import { openSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { version } from '../plugin.json'
+import { version } from '../.claude-plugin/plugin.json'
 import { alive, daemonFile, isDaemon, log, newer, privateStateDir, reachable, readJson, stateDir, writeJson, type DaemonInfo } from './state'
 
 export const instructions =
