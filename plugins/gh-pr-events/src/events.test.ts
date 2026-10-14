@@ -1,15 +1,17 @@
 import { expect, test } from 'bun:test'
 import { createHmac } from 'node:crypto'
-import { beatName, parsePr, secret, summarise, verified } from './server'
+import { beatName, parsePr, summarise, verified } from './events'
+
+const secret = 'test-secret'
 
 const pr = { number: 7, title: 't', html_url: 'u', merged: true, user: { login: 'me' } }
 const base = { repository: { full_name: 'o/r' }, sender: { login: 'bot' } }
 
 test('signature', () => {
   const sig = 'sha256=' + createHmac('sha256', secret).update('x').digest('hex')
-  expect(verified('x', sig)).toBe(true)
-  expect(verified('y', sig)).toBe(false)
-  expect(verified('x', null)).toBe(false)
+  expect(verified('x', sig, secret)).toBe(true)
+  expect(verified('y', sig, secret)).toBe(false)
+  expect(verified('x', null, secret)).toBe(false)
 })
 
 test('summarise', () => {

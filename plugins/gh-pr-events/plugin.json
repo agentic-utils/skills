@@ -1,6 +1,6 @@
 {
   "name": "agentic-utils-gh-pr-events",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Claude Code channel that pushes GitHub PR comments, reviews, state changes and CI results into the session for PRs Claude subscribes to",
   "author": {
     "name": "agentic-utils"
