@@ -15,28 +15,43 @@ Free disk space by finding and removing recreatable or stale data on macOS.
 ### Phase 1: Scan
 
 Run all scans in parallel and present a summary table sorted by size descending.
+Run them under `bash`: zsh aborts a loop on the first unmatched glob.
 
 ```bash
-# Overall disk usage
-df -h /
+# Overall disk usage. `/` is the read-only system volume on modern macOS;
+# user data lives on the Data volume
+df -h /System/Volumes/Data
 
 # Docker (if running)
 docker system df 2>/dev/null
 
 # Dev caches
-du -sh ~/Library/Caches/Yarn/ ~/Library/Caches/pypoetry/ ~/Library/Caches/pip/ ~/Library/Caches/go-build/ ~/Library/Caches/Homebrew/ ~/Library/Caches/node-gyp/ ~/.npm 2>/dev/null
+du -sh ~/Library/Caches/Yarn/ ~/Library/Caches/pypoetry/ ~/Library/Caches/pip/ ~/Library/Caches/go-build/ ~/Library/Caches/Homebrew/ ~/Library/Caches/node-gyp/ ~/.npm ~/.cache/uv ~/.cache/pre-commit ~/go/pkg/mod 2>/dev/null
 
-# Docker data
-du -sh ~/Library/Containers/com.docker.docker/ ~/.docker 2>/dev/null
+# Docker data, plus a stalled Docker Desktop update download
+du -sh ~/Library/Containers/com.docker.docker/ ~/.docker ~/Library/Application\ Support/com.docker.install/in_progress 2>/dev/null
+
+# Biggest dirs in the usual hiding places. This catches runaway logs the fixed
+# lists miss (e.g. ~/.config/gcloud/logs mirrors every command's stdout, so one
+# unbounded `gcloud logging read` can write a 20GB+ file) and media downloads
+# (Podcasts episodes live in a Group Container)
+du -sh ~/* ~/.[!.]* ~/.config/* ~/.cache/* ~/Library/Containers/* ~/Library/Group\ Containers/* 2>/dev/null \
+  | grep -viE 'claude|codex|openai|anthropic' | sort -hr | head -25
+
+# Full macOS installers (~15-20GB each), left behind after an update was staged
+du -sh /Applications/Install\ macOS*.app 2>/dev/null
 
 # Python venvs
-find ~ -name ".venv" -type d -maxdepth 5 2>/dev/null | while read d; do du -sh "$d"; done | sort -hr
+find ~ -name ".venv" -type d -maxdepth 6 -not -path "*/Library/*" 2>/dev/null | while read d; do du -sh "$d"; done | sort -hr
 
-# Git worktrees
-find ~ -name ".worktrees" -type d -maxdepth 4 2>/dev/null | while read d; do du -sh "$d"; done | sort -hr
+# Git worktrees: both the .worktrees and .claude/worktrees conventions
+find ~ -maxdepth 5 -type d \( -name ".worktrees" -o -path "*/.claude/worktrees" \) 2>/dev/null | while read d; do du -sh "$d"; done | sort -hr
 
-# App caches (>100MB)
-for d in ~/Library/Caches/*/; do du -sh "$d" 2>/dev/null; done | sort -hr | awk -F'\t' '{size=$1; if (size ~ /[0-9.]+G/ || (size ~ /[0-9.]+M/ && size+0 > 100)) print}' | head -15
+# App caches (>100MB), agent data filtered out
+for d in ~/Library/Caches/*/; do
+  case "$(basename "$d")" in *[Cc]laude*|*[Cc]odex*|*openai*|*anthropic*) continue ;; esac
+  du -sh "$d" 2>/dev/null
+done | sort -hr | awk -F'\t' '{size=$1; if (size ~ /[0-9.]+G/ || (size ~ /[0-9.]+M/ && size+0 > 100)) print}' | head -15
 
 # iOS/Xcode simulators
 du -sh ~/Library/Developer/CoreSimulator ~/Library/Developer/XCPGDevices 2>/dev/null
@@ -46,9 +61,6 @@ ls -1 ~/.local/state/fnm_multishells 2>/dev/null | wc -l
 
 # Homebrew stale packages
 brew cleanup --dry-run 2>/dev/null | tail -5
-
-# Large Application Support dirs (>500MB)
-for d in ~/Library/Application\ Support/*/; do du -sh "$d" 2>/dev/null; done | sort -hr | head -10
 
 # Orphaned app data — leftover data from uninstalled applications
 # Check common dotdirs and Application Support for apps not in /Applications
@@ -81,7 +93,9 @@ Risk levels:
 - **Safe** — Python .venvs (recreatable with `uv sync`, `poetry install`, or `pip install`)
 - **Safe** — fnm shims for dead PIDs (frees no disk; flag it when the count exceeds ~1000)
 - **Safe** — orphaned app data (only if the application is no longer installed)
-- **Check** — git worktrees (may have uncommitted changes)
+- **Safe** — CLI debug logs (e.g. `~/.config/gcloud/logs`, which gcloud ages out after 30 days anyway)
+- **Check** — git worktrees (may have uncommitted or unpushed commits)
+- **Check** — downloaded media (Podcasts episodes, a staged `Install macOS*.app`)
 - **Check** — Application Support dirs (may contain user data)
 - **Manual** — requires user to decide (e.g. Docker volumes with data)
 
@@ -114,25 +128,34 @@ pip cache purge 2>/dev/null || python3 -m pip cache purge 2>/dev/null
 go clean -cache -modcache
 brew cleanup --prune=all
 rm -rf ~/Library/Caches/node-gyp
+UV_LOCK_TIMEOUT=20 uv cache prune
 ```
+
+Long-running `uvx` processes (MCP servers started by every agent session) hold the uv cache
+lock, so `uv cache prune` waits 5 minutes and fails. If it times out, ask before
+`uv cache clean --force`: it frees the most but can break those running processes until they
+restart.
 
 #### Python venvs
 
 ```bash
 # List and confirm before removing
-find ~ -name ".venv" -type d -maxdepth 5 -exec rm -rf {} +
+find ~ -name ".venv" -type d -maxdepth 6 -not -path "*/Library/*" -exec rm -rf {} +
 ```
 
 #### Git worktrees
 
-Before removing, check each worktree for uncommitted changes:
+Clean is not enough: a clean worktree can hold commits that exist nowhere else. Remove a
+worktree only when its status is clean **and** one of these holds (fetch first):
 
-```bash
-# For each .worktrees directory, check git status
-cd <worktree> && git status --porcelain
-```
+- HEAD equals or is behind its upstream (`git rev-list --count @{u}..HEAD` is `0`)
+- HEAD is an ancestor of `origin/<default>` (`git merge-base --is-ancestor HEAD origin/main`)
+- its PR is merged and HEAD equals the PR head (`gh pr list --head <branch> --state merged --json headRefOid`),
+  which covers squash merges and deleted remote branches
 
-Only remove worktrees with clean working trees. Warn about dirty ones.
+Then `git worktree remove <path>` (never `-f`: it refuses locked and dirty trees, which is
+the point) and `git branch -D <branch>`. Skip any worktree modified in the last 3 days, since
+a live session may own it. List what was kept, and why, for the user.
 
 #### App caches
 
@@ -175,9 +198,24 @@ Only remove directories for applications that are confirmed NOT installed:
 - Remove both the dotdir (`~/.appname`) and `~/Library/Application Support/AppName` if the app is absent
 - Ask the user to confirm before removing any Application Support directories
 
+#### Space `du` cannot see
+
+If `df` used is well above what the home and `/Applications` scans add up to, the rest is in
+root-only dirs. Ask the user to run this (it takes minutes, so run it in the background):
+
+```bash
+sudo du -xh -d 3 /System/Volumes/Data 2>/dev/null | sort -hr | head -30
+```
+
+Expect the Spotlight index, system databases and endpoint-security agent data. Flag anything
+outsized, but leave managed security tooling to whoever owns it.
+
 ### Phase 4: Report
 
-Show before/after disk usage with `df -h /` and a summary of space freed per category.
+Show before/after disk usage with `df -h /System/Volumes/Data` and the space freed per
+category. Take a `df` reading around each step rather than adding up `du` sizes: venvs and
+the uv cache share blocks through APFS clones, so their `du` sizes overstate what deleting
+them frees.
 
 ## Safety rules
 
