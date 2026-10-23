@@ -1,11 +1,11 @@
 ---
 name: session-handoff
-description: Hand a task to a NEW local Claude Code session in its own iTerm tab, with the brief attached as its first turn and the parent's name in it so the child hands back via SendMessage and exits, and the parent cleans up its worktree. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "new session for X", "start a session to do Y", or "handoff".
+description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands back via SendMessage and exits, and the parent cleans up its worktree. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
 ---
 
 # Session Handoff
 
-Start a new Claude Code session in its own iTerm tab with the brief already attached, so the brief is the session's first turn. The brief names the parent session, so the child knows who to report back to.
+Start a new Claude Code session in its own tmux window or iTerm tab with the brief already attached, so the brief is the session's first turn. The brief names the parent session, so the child knows who to report back to.
 
 ## Step 1: Find your own name
 
@@ -40,7 +40,7 @@ When done or blocked, hand back and exit:
    If the send failed, stay open so the handback isn't lost.
 ````
 
-Claude Code fills in `${CLAUDE_SKILL_DIR}` when it loads this skill, so copy the full path you see here into the brief. The script sends SIGTERM to the nearest `claude` ancestor of its shell, which is the child's own top-level process, and the iTerm tab closes with it.
+Claude Code fills in `${CLAUDE_SKILL_DIR}` when it loads this skill, so copy the full path you see here into the brief. The script sends SIGTERM to the nearest `claude` ancestor of its shell, which is the child's own top-level process, and its tab or window closes with it.
 
 The exit asks for approval on purpose: a person sees the handback land before the session ends. Don't pre-approve it in `allowed-tools` or settings.
 
@@ -71,21 +71,18 @@ chmod +x "$S/launch.sh"
 
 ## Step 4: Launch
 
-Attach the command when the tab is created:
+Open it with the bundled `open-tab.sh`, which picks the terminal for you:
 
 ```bash
-osascript <<APPLESCRIPT
-tell application "iTerm2"
-  tell current window
-    create tab with default profile command "'$S/launch.sh' '<repo-main-checkout>' '<name>' '$S/brief.md'"
-  end tell
-end tell
-APPLESCRIPT
+${CLAUDE_SKILL_DIR}/open-tab.sh <name> "$S/launch.sh" <repo-main-checkout> <name> "$S/brief.md"
 ```
 
-- No iTerm window open? `tell current window` fails; use `create window with default profile command "..."` instead.
-- Single-quote each argument inside the `command` string, so paths with spaces survive.
-- **Never** `create tab` and then `write text` into `current session`. If the create silently fails, `current session` is YOUR tab and the command gets typed into your own prompt.
+- **Inside tmux** (`$TMUX` set): a new window named `<name>`. The arguments go to tmux as separate words, so nothing needs quoting.
+- **In iTerm** (`$TERM_PROGRAM` is `iTerm.app`): a new tab in the current window, or a new window if none is open. Each argument is single-quoted into the AppleScript `command`, so avoid paths containing `'`.
+- **Anything else**: it exits 1 and prints the command to start by hand.
+
+Either way the command is attached when the tab or window is created. Never create a tab and then `write text` into `current session` (or `send-keys` to the current pane): if the create silently fails, that is YOUR terminal, and the command gets typed into your own prompt. `test.sh` next to the scripts covers all three paths and the exit step; run it after changing either script.
+
 - **Never** start a bare session and `SendMessage` the brief afterwards. It queues behind the trust dialog, and cross-session messaging is for sessions that already exist.
 
 ### Trust
@@ -101,17 +98,10 @@ Run the loop under bash, not zsh. zsh does not word-split unquoted variables, so
 
 ```bash
 # jobs.txt: one "<name> <launch-dir> <brief-file>" per line
-bash <<'EOF'
-while read -r t; do
+bash -c 'while read -r t; do
   set -- $t
-  cmd="'$HOME/.claude/handoff/launch.sh' '$2' '$1' '$3'"
-  osascript - "$cmd" <<'AS'
-on run argv
-  tell application "iTerm2" to tell current window to create tab with default profile command (item 1 of argv)
-end run
-AS
-done < ~/.claude/handoff/jobs.txt
-EOF
+  "$0" "$1" ~/.claude/handoff/launch.sh "$2" "$1" "$3"
+done < ~/.claude/handoff/jobs.txt' ${CLAUDE_SKILL_DIR}/open-tab.sh
 ```
 
 ## Names
@@ -132,7 +122,7 @@ Pick a name none of your own subagents or forks has used. `SendMessage` resolves
 
 The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
 
-1. **Confirm the child exited**: `ps -p <pid> || echo gone`, where the pid is the one in the `from="uds:/tmp/cc-socks/<pid>.sock"` attribute. If it's still alive, it's probably waiting for someone to approve `exit-session.sh` in its tab.
+1. **Confirm the child exited**: `ps -p <pid> || echo gone`, where the pid is the one in the `from="uds:/tmp/cc-socks/<pid>.sock"` attribute. If it's still alive, it's probably waiting for someone to approve `exit-session.sh` in its tab or window.
 2. **Take over the leftover work**: subscribe to the child's PRs (its subscriptions died with it), reply to open threads, schedule the follow-ups it asked for.
 3. **Remove its worktree**, from the repo's main checkout:
 
@@ -145,7 +135,7 @@ The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
 
 ## Debugging a launch that exits early
 
-Wrap the launcher so the tab stays open and stderr is kept:
+Wrap the launcher so the tab or window stays open and stderr is kept:
 
 ```bash
 cat > "$S/debug.sh" <<'EOF'
