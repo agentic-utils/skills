@@ -1,0 +1,23 @@
+name: claude-code plugin
+
+on:
+  pull_request:
+    paths: ['plugins/claude-code/**', '.github/workflows/claude-code-plugin.yml']
+  push:
+    branches: [main]
+    paths: ['plugins/claude-code/**', '.github/workflows/claude-code-plugin.yml']
+
+jobs:
+  session-handoff:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y tmux
+      - if: runner.os == 'macOS'
+        run: brew install tmux
+      - run: plugins/claude-code/skills/session-handoff/test.sh
