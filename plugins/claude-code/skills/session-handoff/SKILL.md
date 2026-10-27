@@ -1,6 +1,6 @@
 ---
 name: session-handoff
-description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands its leftovers back via SendMessage and the parent then closes it and cleans up its worktree. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
+description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands its leftovers back via SendMessage and the parent then closes it and cleans up what it left behind. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
 ---
 
 # Session Handoff
@@ -37,7 +37,7 @@ End every brief with:
 ````markdown
 When done or blocked, hand back and stop:
 
-1. SendMessage the parent: results, PR URLs, the worktree path and branch, and every piece of leftover work (open PRs to watch, review threads, follow-ups to schedule). The parent takes all of it over, so leave nothing only you know about.
+1. SendMessage the parent: results, PR URLs, every piece of leftover work (open PRs to watch, review threads, follow-ups to schedule), and everything you created that should go once you're closed: worktrees and their branches, background processes you started with `&` or `nohup` (dev servers, port-forwards, proxies), each with its pid and command, and temp files and directories. The parent takes all of it over and cleans it up, so leave nothing only you know about.
 2. Also put the handback in your final message, in case the parent has exited.
 3. Then stop. Don't start anything new and don't exit: the parent closes this session once it has taken the handback.
 ````
@@ -128,14 +128,16 @@ The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
    ```
 
    It sends SIGTERM only if that process was started with `--name <name>`, so a wrong or reused pid can't close another session, and it waits for the exit. The tab or window closes with it.
-3. **Remove its worktree**, from the repo's main checkout:
+3. **Clean up what it left behind**, working through the handback's list. For each worktree, from the repo's main checkout:
 
    ```bash
    git -C <repo-main-checkout> worktree remove .claude/worktrees/<name>   # refuses if dirty: read what's there, never --force blindly
    git -C <repo-main-checkout> branch -d <branch>                         # refuses if unmerged: keep it while its PR is open
    ```
 
-   Do this only after `close-session.sh` reports it closed and the branch is pushed. A dirty worktree means the child left something out of its handback, so ask it (or read the diff) before discarding anything.
+   Do this only after `close-session.sh` reports it closed and the branch is pushed. A dirty worktree means the child left something out of its handback: read the diff before discarding anything.
+
+   Then stop each process it listed, after checking the pid still runs that command (`ps -o command= -p <pid>`), since pids get reused. Claude's own background tasks die with the session, but anything started with `&` or `nohup` was reparented to pid 1 as soon as it started, so the handback is the only record of it. Delete the temp files it listed, plus the brief and launcher you wrote for it. Check `git worktree list` in each repo it touched for a `.claude/worktrees/<name>` the handback didn't mention. Leave its transcript under `~/.claude/projects/` alone: that is the record of what it did.
 
 ## Debugging a launch that exits early
 
