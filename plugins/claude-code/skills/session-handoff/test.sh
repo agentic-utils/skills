@@ -1,12 +1,12 @@
 #!/bin/sh
-# Regression tests for open-tab.sh and exit-session.sh. Needs tmux; no iTerm or claude needed.
+# Regression tests for open-tab.sh and close-session.sh. Needs tmux; no iTerm or claude needed.
 set -u
 dir=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
 sock="handoff-test-$$"
 fails=0
-pid=
-trap 'tmux -L "$sock" kill-server 2>/dev/null; [ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$tmp"' EXIT
+pids=
+trap 'tmux -L "$sock" kill-server 2>/dev/null; [ -n "$pids" ] && kill $pids 2>/dev/null; rm -rf "$tmp"' EXIT
 
 check() { # <description> <command...>
   d=$1
@@ -52,17 +52,24 @@ env -u TMUX TERM_PROGRAM=other "$dir/open-tab.sh" child true 2> "$tmp/err"
 code=$?
 check "other terminal: exits 1 with a message" sh -c "[ $code = 1 ] && grep -q 'start it yourself' '$tmp/err'"
 
-# --- exit-session.sh: a symlink to sh named claude stands in for the session process.
-# Each case is double-forked so it is reparented to pid 1: a broken walk can't reach
-# a real claude running these tests.
-ln -s /bin/sh "$tmp/claude" # a copy of a system binary gets killed on macOS
-( "$tmp/claude" -c "sleep 0.5; echo \$\$ > '$tmp/pid'; sh -c '\"$dir/exit-session.sh\"'; sleep 10; echo survived" > "$tmp/out" 2>&1 & )
-wait_for 5 [ -s "$tmp/pid" ]
-pid=$(cat "$tmp/pid" 2>/dev/null)
-check "exit: fake claude started" [ -n "$pid" ]
-check "exit: kills its nearest claude ancestor" wait_for 3 sh -c "[ -n '$pid' ] && ! kill -0 '$pid' 2>/dev/null"
-check "exit: the ancestor dies before running on" sh -c "! grep -q survived '$tmp/out'"
-( sh -c "sleep 0.5; '$dir/exit-session.sh' 2> '$tmp/err'; echo \$? > '$tmp/code'" & )
-check "exit: no claude ancestor exits 1" wait_for 5 sh -c "[ \"\$(cat '$tmp/code' 2>/dev/null)\" = 1 ] && grep -q 'no claude ancestor' '$tmp/err'"
+# --- close-session.sh: `sh -c` processes carrying --name stand in for child sessions
+fake() { sh -c 'sleep 30; :' fake --name "$1" & pids="$pids $!"; }
+fake worker-a
+a=$!
+"$dir/close-session.sh" "$a" worker-a > /dev/null
+code=$?
+check "close: closes the named session" sh -c "[ $code = 0 ] && ! kill -0 $a 2>/dev/null"
+fake worker-ab
+ab=$!
+"$dir/close-session.sh" "$ab" worker-a 2> /dev/null
+code=$?
+check "close: refuses a pid whose name only starts with it" sh -c "[ $code = 1 ] && kill -0 $ab"
+"$dir/close-session.sh" "$ab" other 2> /dev/null
+code=$?
+check "close: refuses a pid with another name" sh -c "[ $code = 1 ] && kill -0 $ab"
+"$dir/close-session.sh" 999999 worker-a 2> /dev/null
+check "close: no such pid exits 1" [ $? = 1 ]
+"$dir/close-session.sh" "$ab" 2> /dev/null
+check "close: missing name exits 2" [ $? = 2 ]
 
 [ "$fails" = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

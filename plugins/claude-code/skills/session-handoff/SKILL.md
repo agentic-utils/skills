@@ -1,11 +1,15 @@
 ---
 name: session-handoff
-description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands back via SendMessage and exits, and the parent cleans up its worktree. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
+description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands its leftovers back via SendMessage and the parent then closes it and cleans up its worktree. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
 ---
 
 # Session Handoff
 
-Start a new Claude Code session in its own tmux window or iTerm tab with the brief already attached, so the brief is the session's first turn. The brief names the parent session, so the child knows who to report back to.
+Start a new Claude Code session in its own tmux window or iTerm tab with the brief already attached, so the brief is the session's first turn. The brief names the parent session, so the child knows who to report back to. When the child hands back, the parent closes it.
+
+## When to use it
+
+Only for a clear tangent: work that is independent of the current task, would derail this session, and ends in its own result (a separate PR, a fix in another repo) that nobody here waits on. Otherwise use a regular subagent (the Agent tool, or a fork): research, reviews, and anything whose answer this session needs to continue. A subagent reports straight back into this conversation and needs no tab, trust dialog or cleanup.
 
 ## Step 1: Find your own name
 
@@ -26,23 +30,17 @@ Then:
 - **Plan**: numbered steps
 - **Rules and constraints**: what it must not do, who merges, what needs asking first
 - **Handback shape**: exactly what to send back (results, PR URLs, what's left, any follow-up it wants the parent to schedule)
-- **Self-destruct**: the closing block below
+- **Handback and stop**: the closing block below
 
 End every brief with:
 
 ````markdown
-When done or blocked, hand back and exit:
+When done or blocked, hand back and stop:
 
 1. SendMessage the parent: results, PR URLs, the worktree path and branch, and every piece of leftover work (open PRs to watch, review threads, follow-ups to schedule). The parent takes all of it over, so leave nothing only you know about.
 2. Also put the handback in your final message, in case the parent has exited.
-3. Only if the SendMessage succeeded, end this session by running exactly this, on its own:
-   `${CLAUDE_SKILL_DIR}/exit-session.sh`
-   If the send failed, stay open so the handback isn't lost.
+3. Then stop. Don't start anything new and don't exit: the parent closes this session once it has taken the handback.
 ````
-
-Claude Code fills in `${CLAUDE_SKILL_DIR}` when it loads this skill, so copy the full path you see here into the brief. The script sends SIGTERM to the nearest `claude` ancestor of its shell, which is the child's own top-level process, and its tab or window closes with it.
-
-The exit asks for approval on purpose: a person sees the handback land before the session ends. Don't pre-approve it in `allowed-tools` or settings.
 
 Never `@`-import files in the brief; point at paths and let the child read them.
 
@@ -81,7 +79,7 @@ ${CLAUDE_SKILL_DIR}/open-tab.sh <name> "$S/launch.sh" <repo-main-checkout> <name
 - **In iTerm** (`$TERM_PROGRAM` is `iTerm.app`): a new tab in the current window, or a new window if none is open. Each argument is single-quoted into the AppleScript `command`, so avoid paths containing `'`.
 - **Anything else**: it exits 1 and prints the command to start by hand.
 
-Either way the command is attached when the tab or window is created. Never create a tab and then `write text` into `current session` (or `send-keys` to the current pane): if the create silently fails, that is YOUR terminal, and the command gets typed into your own prompt. `test.sh` next to the scripts covers all three paths and the exit step; run it after changing either script.
+Either way the command is attached when the tab or window is created. Never create a tab and then `write text` into `current session` (or `send-keys` to the current pane): if the create silently fails, that is YOUR terminal, and the command gets typed into your own prompt. `test.sh` next to the scripts covers all three paths and `close-session.sh`; run it after changing either script.
 
 - **Never** start a bare session and `SendMessage` the brief afterwards. It queues behind the trust dialog, and cross-session messaging is for sessions that already exist.
 
@@ -122,8 +120,14 @@ Pick a name none of your own subagents or forks has used. `SendMessage` resolves
 
 The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
 
-1. **Confirm the child exited**: `ps -p <pid> || echo gone`, where the pid is the one in the `from="uds:/tmp/cc-socks/<pid>.sock"` attribute. If it's still alive, it's probably waiting for someone to approve `exit-session.sh` in its tab or window.
-2. **Take over the leftover work**: subscribe to the child's PRs (its subscriptions died with it), reply to open threads, schedule the follow-ups it asked for.
+1. **Take over the leftover work**: subscribe to the child's PRs (its subscriptions end when it closes), reply to open threads, schedule the follow-ups it asked for. If anything in the handback is unclear, ask the child now, while it's still open.
+2. **Close the child**, with the pid from the message's `from="uds:/tmp/cc-socks/<pid>.sock"` attribute:
+
+   ```bash
+   ${CLAUDE_SKILL_DIR}/close-session.sh <pid> <name>
+   ```
+
+   It sends SIGTERM only if that process was started with `--name <name>`, so a wrong or reused pid can't close another session, and it waits for the exit. The tab or window closes with it.
 3. **Remove its worktree**, from the repo's main checkout:
 
    ```bash
@@ -131,7 +135,7 @@ The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
    git -C <repo-main-checkout> branch -d <branch>                         # refuses if unmerged: keep it while its PR is open
    ```
 
-   Do this only once the child is gone and its branch is pushed. A dirty worktree means the child left something out of its handback, so ask it (or read the diff) before discarding anything.
+   Do this only after `close-session.sh` reports it closed and the branch is pushed. A dirty worktree means the child left something out of its handback, so ask it (or read the diff) before discarding anything.
 
 ## Debugging a launch that exits early
 
