@@ -53,7 +53,7 @@
     {
       "name": "agentic-utils-claude-code",
       "description": "Skills grounded in Claude Code internals",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "source": "./plugins/claude-code",
       "category": "utilities"
     },

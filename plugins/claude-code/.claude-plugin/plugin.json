@@ -1,6 +1,6 @@
 {
   "name": "agentic-utils-claude-code",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Skills grounded in Claude Code internals: memory consolidation, memory writing, compaction checkpointing, bash safety, the Anthropic-employee prompt differences, session handoff, and delegating to the Codex CLI.",
   "author": {
     "name": "agentic-utils"
