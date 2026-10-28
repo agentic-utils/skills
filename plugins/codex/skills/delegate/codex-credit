@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Print Codex's remaining capacity without starting a task.
+
+Asks the local `codex app-server` for account/rateLimits/read (what /status
+shows). Exit 0 if Codex can take work now, 1 if not, 2 if the check failed.
+"""
+
+import datetime
+import json
+import select
+import subprocess
+import sys
+import time
+
+
+def read_limits():
+    proc = subprocess.Popen(
+        ["codex", "app-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        for message in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"clientInfo": {"name": "codex-credit", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"},
+        ):
+            proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if not select.select([proc.stdout], [], [], 1)[0]:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                return None
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if reply.get("id") == 2:
+                return reply.get("result")
+        return None
+    finally:
+        proc.kill()
+
+
+# Any crash must exit 2, never 1: callers read 1 as "no usage left".
+try:
+    result = read_limits()
+except Exception as exc:  # noqa: BLE001
+    print(f"codex-credit: check failed: {exc}")
+    sys.exit(2)
+
+if not result:
+    print("codex-credit: no answer from codex app-server (logged in?)")
+    sys.exit(2)
+
+limits = result.get("rateLimits") or {}
+primary = limits.get("primary") or {}
+resets = primary.get("resetsAt")
+resets = (
+    datetime.datetime.fromtimestamp(resets, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if resets
+    else "n/a"
+)
+allowed = bool(result.get("ordinaryUsageAllowed"))
+free = (result.get("rateLimitResetCredits") or {}).get("availableCount", 0)
+print(
+    f"allowed={str(allowed).lower()} used={primary.get('usedPercent', '?')}% "
+    f"resets={resets} credits={str((limits.get('credits') or {}).get('hasCredits', False)).lower()} "
+    f"reason={limits.get('rateLimitReachedType') or 'none'} free_resets={free}"
+)
+sys.exit(0 if allowed else 1)
