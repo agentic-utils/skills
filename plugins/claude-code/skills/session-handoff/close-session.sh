@@ -1,16 +1,17 @@
 #!/bin/sh
 # Usage: close-session.sh <pid> <name>
 # Closes a child session after its handback: SIGTERM to <pid>, but only if that process
-# was started with --name <name>, so a wrong or reused pid can't hit another session.
+# was started with --name <name> (Claude) or --add-dir <...>/handoff/<name> (codex), so a
+# wrong or reused pid can't hit another session.
 pid=$1
 name=$2
 if [ -z "$pid" ] || [ -z "$name" ]; then
   echo "usage: close-session.sh <pid> <name>" >&2
   exit 2
 fi
-cmd=$(ps -o command= -p "$pid") || { echo "close-session.sh: no process $pid" >&2; exit 1; }
+cmd=$(ps -ww -o command= -p "$pid") || { echo "close-session.sh: no process $pid" >&2; exit 1; }
 case "$cmd " in
-  *"--name $name "*) ;;
+  *"--name $name "* | *"--add-dir "*"/handoff/$name "*) ;;
   *)
     echo "close-session.sh: $pid is not session $name, leaving it alone" >&2
     exit 1

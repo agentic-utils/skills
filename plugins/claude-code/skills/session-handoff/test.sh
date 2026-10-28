@@ -72,4 +72,17 @@ check "close: no such pid exits 1" [ $? = 1 ]
 "$dir/close-session.sh" "$ab" 2> /dev/null
 check "close: missing name exits 2" [ $? = 2 ]
 
+# codex children carry their name as --add-dir <...>/handoff/<name>
+fakecodex() { sh -c 'sleep 30; :' codex -s workspace-write --add-dir "$tmp/handoff/$1" "brief" & pids="$pids $!"; }
+fakecodex coder-a
+c=$!
+"$dir/close-session.sh" "$c" coder-a > /dev/null
+code=$?
+check "close: closes the named codex session" sh -c "[ $code = 0 ] && ! kill -0 $c 2>/dev/null"
+fakecodex coder-ab
+cab=$!
+"$dir/close-session.sh" "$cab" coder-a 2> /dev/null
+code=$?
+check "close: refuses a codex pid whose name only starts with it" sh -c "[ $code = 1 ] && kill -0 $cab"
+
 [ "$fails" = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

@@ -1,6 +1,6 @@
 ---
 name: session-handoff
-description: Hand a task to a NEW local Claude Code session in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn and the parent's name in it so the child hands its leftovers back via SendMessage and the parent then closes it and cleans up what it left behind. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
+description: Hand a task to a NEW local Claude Code session (or an interactive Codex CLI session) in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn so the child hands its leftovers back (Claude via SendMessage, codex via a watched handback file) and the parent then closes it and cleans up what it left behind. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "hand this off to codex", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
 ---
 
 # Session Handoff
@@ -138,6 +138,61 @@ The handback arrives as a `<cross-session-message from-name="<name>">`. Then:
    Do this only after `close-session.sh` reports it closed and the branch is pushed. A dirty worktree means the child left something out of its handback: read the diff before discarding anything.
 
    Then stop each process it listed, after checking the pid still runs that command (`ps -o command= -p <pid>`), since pids get reused. Claude's own background tasks die with the session, but anything started with `&` or `nohup` was reparented to pid 1 as soon as it started, so the handback is the only record of it. Delete the temp files it listed, plus the brief and launcher you wrote for it. Check `git worktree list` in each repo it touched for a `.claude/worktrees/<name>` the handback didn't mention. Leave its transcript under `~/.claude/projects/` alone: that is the record of what it did.
+
+## Handing off to codex
+
+The child can be an interactive [Codex CLI](https://github.com/openai/codex) session instead of Claude. Codex can't `SendMessage`, so it hands back through a file and the parent watches for it. The handback reaches the parent as a background-task notification, with no Claude relay in between. Steps 1, 2 and 4 are as above. These replace the rest:
+
+**Worktree.** Create it yourself, so the cleanup in step 6 works unchanged. codex's own `--worktree` picks a path and branch you would have to discover.
+
+```bash
+git -C <repo-main-checkout> worktree add -b <branch> .claude/worktrees/<name> origin/<default>
+```
+
+**Brief.** Write it to `$S/<name>/brief.md`, a folder per child that codex is allowed to write to. Replace the closing block with:
+
+````markdown
+When done or blocked, hand back and stop:
+
+1. Write the handback (results, PR URLs, leftover work, everything you created that should go once you're closed: worktrees, branches, background processes with pid and command, temp files) to `<S>/<name>/handback.md.tmp`, then `mv` it to `<S>/<name>/handback.md`. The parent is watching for that file.
+2. Then stop. Don't exit: the parent closes this session once it has taken the handback.
+````
+
+Spell `<S>` out as an absolute path in the brief: codex doesn't expand `~` in prose.
+
+**Launcher.**
+
+```bash
+mkdir -p "$S/<name>"
+X=$(whence -p codex)
+cat > "$S/launch-codex.sh" <<EOF
+#!/bin/zsh -l
+# \$1 = worktree, \$2 = this child's handoff folder (holds brief.md, receives handback.md)
+cd "\$1" || exit 1
+exec "$X" -s workspace-write -a never --add-dir "\$2" "\$(cat "\$2/brief.md")"
+EOF
+chmod +x "$S/launch-codex.sh"
+${CLAUDE_SKILL_DIR}/open-tab.sh <name> "$S/launch-codex.sh" <worktree> "$S/<name>"
+```
+
+- `--add-dir` makes the handoff folder writable. It is also how `close-session.sh` recognises the codex child, so keep it exactly `--add-dir <...>/handoff/<name>`.
+- `-a never` stops codex pausing for approval in a tab nobody is watching. The `workspace-write` sandbox still confines what it can change.
+- If codex asks whether to trust the folder, answer it in the tab, as with Claude's trust dialog.
+
+**Watch for the handback.** Straight after launching, find the pid and start a background wait (`run_in_background`) that ends on the handback **or** on codex exiting, so a crash isn't silent:
+
+```bash
+pid=$(pgrep -f "[a]dd-dir $S/<name>")
+until [ -s "$S/<name>/handback.md" ]; do
+  kill -0 "$pid" 2>/dev/null || { echo "codex exited without a handback"; exit 1; }
+  sleep 2
+done
+cat "$S/<name>/handback.md"
+```
+
+When it completes, follow step 6 with that pid: `close-session.sh <pid> <name>` closes the codex tab. Delete `$S/<name>/` along with the launcher.
+
+**Not by socket.** Codex can reach the parent's message socket the way `ccs` does, but only with `sandbox_workspace_write.network_access=true`. That also opens the network to every command codex runs, and the socket protocol is undocumented. The file handback needs neither.
 
 ## Debugging a launch that exits early
 
