@@ -4,15 +4,15 @@ Seven skills grounded in Claude Code's source code. Each one surfaces an interna
 
 ## Skills
 
-| Skill               | Trigger phrases                                                     | Description                                                                                                                              |
-| ------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| [`dream`]           | "dream", "consolidate memory", "clean up CLAUDE.md"                 | Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm                                           |
-| [`memory-writer`]   | "write a memory", "add to CLAUDE.md", "update memory files"         | Write memory entries that get selected. Covers description field scoring, staleness, index limits                                        |
-| [`compaction-prep`] | "prep for compaction", "checkpoint", "context is filling up"        | Checkpoint mid-task state so the compacted session resumes exactly where it left off                                                     |
-| [`bash-safety`]     | "check this bash", "is this safe to run", "review this script"      | Exit code semantics table plus dangerous pattern checklist                                                                               |
-| [`ant-mode`]        | "enable ant mode", "use the Anthropic prompt"                       | Add the 5 Anthropic-employee prompt differences to your CLAUDE.md                                                                        |
-| [`session-handoff`] | "hand this off to another session", "hand this off to codex"        | Launch a new Claude or codex session in a tmux window or iTerm tab with the brief attached; the child reports back to its parent         |
-| [`codex-delegate`]  | "ask codex", "delegate to codex", "have codex review/research this" | Hand one task to `codex exec` (needs the Codex CLI): credit preflight, background-safe run, answer plus token usage, relay-only subagent |
+| Skill               | Trigger phrases                                                    | Description                                                                                                                                   |
+| ------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`dream`]           | "dream", "consolidate memory", "clean up CLAUDE.md"                | Consolidate and prune memory files using the 4-phase Orient/Gather/Consolidate/Prune algorithm                                                |
+| [`memory-writer`]   | "write a memory", "add to CLAUDE.md", "update memory files"        | Write memory entries that get selected. Covers description field scoring, staleness, index limits                                             |
+| [`compaction-prep`] | "prep for compaction", "checkpoint", "context is filling up"       | Checkpoint mid-task state so the compacted session resumes exactly where it left off                                                          |
+| [`bash-safety`]     | "check this bash", "is this safe to run", "review this script"     | Exit code semantics table plus dangerous pattern checklist                                                                                    |
+| [`ant-mode`]        | "enable ant mode", "use the Anthropic prompt"                      | Add the 5 Anthropic-employee prompt differences to your CLAUDE.md                                                                             |
+| [`session-handoff`] | "hand this off to another session", "hand this off to codex"       | Hand a tangent nobody here waits on to a new Claude or codex session in its own tab and worktree; the child reports back to its parent        |
+| [`codex-delegate`]  | "ask codex", "get codex's take", "have codex review/research this" | Get an answer this conversation needs from `codex exec` (needs the Codex CLI): credit preflight, background-safe run, answer plus token usage |
 
 ## Install
 

@@ -1,11 +1,15 @@
 ---
 name: codex-delegate
-description: Delegate a self-contained task to the Codex CLI (`codex exec`) non-interactively and get back its answer and token usage. Covers the credit preflight, a background-safe invocation, read-only vs workspace-write sandbox, raising reasoning effort for adversarial review, web research, and relaying through a cheap subagent so the output stays out of the main context. Use when asked to "ask codex", "delegate to codex", "get a second opinion from codex", "have codex review this", "have codex research this", "run codex exec", or before spawning an in-session agent for work codex could do.
+description: Get an answer from the Codex CLI (`codex exec`) that THIS conversation needs, such as a second opinion, a review of a diff or design, web research or a non-interactive edit. One headless run; the answer and token usage come back here. Covers the credit preflight, a background-safe invocation, sandbox and reasoning-effort choices, and relaying through a cheap subagent. Use when asked to "ask codex", "get codex's take", "get a second opinion from codex", "have codex review this", "have codex research this", "run codex exec", or, when codex is installed, before spawning a Claude subagent for self-contained work codex could do. For separate work codex should carry on in its own tab, use session-handoff instead.
 ---
 
 # Delegate to Codex
 
 Hand one self-contained task to `codex exec` and get back a single answer plus its token usage. Good fits: a second model's view on a design or diff, an adversarial review, web research, and non-interactive edits you want off your own quota.
+
+**Which skill.** Use this one when this conversation waits for the answer. Separate work that ends in its own result (a branch, a PR, a fix in another repo), which codex should carry on in its own tab, goes to `session-handoff` instead. "Have codex do X" means this skill for a question, review or research, and `session-handoff` for implementation that ends in its own PR.
+
+**When not to.** If the task needs this conversation's context, use a fork. If it needs a Claude-only tool or MCP server, use a Claude subagent.
 
 Needs the [Codex CLI](https://github.com/openai/codex) installed and logged in. If `codex` isn't on `PATH`, this skill doesn't apply: do the work in-session and don't install codex unasked. The preflight below checks for it.
 

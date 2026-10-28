@@ -1,6 +1,6 @@
 ---
 name: session-handoff
-description: Hand a task to a NEW local Claude Code session (or an interactive Codex CLI session) in its own tmux window or iTerm tab (detected automatically), with the brief attached as its first turn so the child hands its leftovers back (Claude via SendMessage, codex via a watched handback file) and the parent then closes it and cleans up what it left behind. Only for a clear tangent; work that feeds the current task goes to a subagent. Use when asked to "hand this off to another session", "hand this off to codex", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
+description: Hand a clear tangent to a NEW local session, Claude Code or an interactive Codex CLI, in its own tmux window or iTerm tab (detected automatically) and worktree. The brief is its first turn; the child hands back its leftovers (Claude via SendMessage, codex via a watched handback file) and the parent closes it and cleans up what it left behind. Only for work nobody here waits on; an answer this conversation needs goes to a subagent, or to codex-delegate for codex. Use when asked to "hand this off to another session", "hand this off to codex", "open a codex tab for this", "launch a new claude session", "spin up a tab for this", "open a tmux window for this", "new session for X", "start a session to do Y", or "handoff".
 ---
 
 # Session Handoff
@@ -9,7 +9,9 @@ Start a new Claude Code session in its own tmux window or iTerm tab with the bri
 
 ## When to use it
 
-Only for a clear tangent: work that is independent of the current task, would derail this session, and ends in its own result (a separate PR, a fix in another repo) that nobody here waits on. Otherwise use a regular subagent (the Agent tool, or a fork): research, reviews, and anything whose answer this session needs to continue. A subagent reports straight back into this conversation and needs no tab, trust dialog or cleanup.
+Only for a clear tangent: work that is independent of the current task, would derail this session, and ends in its own result (a separate PR, a fix in another repo) that nobody here waits on. Otherwise use a regular subagent (the Agent tool, or a fork): research, reviews, and anything whose answer this session needs to continue. A subagent reports straight back into this conversation and needs no tab, trust dialog or cleanup. The same split applies to codex: an answer you need now goes to the `codex-delegate` skill, and separate work codex carries on in its own tab comes here.
+
+The test: will this conversation wait for the result? Yes means a subagent or `codex-delegate`. No means a handoff.
 
 ## Step 1: Find your own name
 
@@ -159,6 +161,14 @@ When done or blocked, hand back and stop:
 ````
 
 Spell `<S>` out as an absolute path in the brief: codex doesn't expand `~` in prose.
+
+**Preflight.** Check codex is installed and has usage left before opening the tab. Otherwise the child fails in a tab nobody is watching and never writes a handback:
+
+```bash
+${CLAUDE_SKILL_DIR}/../codex-delegate/codex-credit   # exit 0 go; 1 no usage left; 2 not installed or check failed
+```
+
+On 1 or 2, don't launch. Tell the user, or hand off to a Claude session instead. Never spend a free rate-limit reset without asking.
 
 **Launcher.**
 
