@@ -1,11 +1,13 @@
 ---
-name: delegate
+name: codex-delegate
 description: Delegate a self-contained task to the Codex CLI (`codex exec`) non-interactively and get back its answer and token usage. Covers the credit preflight, a background-safe invocation, read-only vs workspace-write sandbox, raising reasoning effort for adversarial review, web research, and relaying through a cheap subagent so the output stays out of the main context. Use when asked to "ask codex", "delegate to codex", "get a second opinion from codex", "have codex review this", "have codex research this", "run codex exec", or before spawning an in-session agent for work codex could do.
 ---
 
 # Delegate to Codex
 
 Hand one self-contained task to `codex exec` and get back a single answer plus its token usage. Good fits: a second model's view on a design or diff, an adversarial review, web research, and non-interactive edits you want off your own quota.
+
+Needs the [Codex CLI](https://github.com/openai/codex) installed and logged in. If `codex` isn't on `PATH`, this skill doesn't apply: do the work in-session and don't install codex unasked. The preflight below checks for it.
 
 ## Step 1: Preflight
 
@@ -18,11 +20,11 @@ ${CLAUDE_SKILL_DIR}/codex-credit
 
 It asks the local `codex app-server` for the same limits `/status` shows, without starting a task.
 
-| Exit | Meaning                                         | Do                                       |
-| ---- | ----------------------------------------------- | ---------------------------------------- |
-| 0    | Codex can take work                             | Go to step 2                             |
-| 1    | Usage limit reached or credits used up          | Don't launch codex; do the work yourself |
-| 2    | Check failed (codex missing, logged out, crash) | Report it; don't launch codex blind      |
+| Exit | Meaning                                               | Do                                                        |
+| ---- | ----------------------------------------------------- | --------------------------------------------------------- |
+| 0    | Codex can take work                                   | Go to step 2                                              |
+| 1    | Usage limit reached or credits used up                | Don't launch codex; do the work yourself                  |
+| 2    | Check failed (codex not installed, logged out, crash) | Report it; don't launch codex blind; do the work yourself |
 
 **Never spend a free rate-limit reset** (`free_resets` above, the app-server's `account/rateLimitResetCredit/consume`) without asking the user first. They are scarce and the user decides when one is worth it.
 

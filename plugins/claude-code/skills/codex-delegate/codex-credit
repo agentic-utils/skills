@@ -8,9 +8,14 @@ shows). Exit 0 if Codex can take work now, 1 if not, 2 if the check failed.
 import datetime
 import json
 import select
+import shutil
 import subprocess
 import sys
 import time
+
+if shutil.which("codex") is None:
+    print("codex-credit: codex CLI not installed (not on PATH)")
+    sys.exit(2)
 
 
 def read_limits():

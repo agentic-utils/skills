@@ -53,7 +53,7 @@
     {
       "name": "agentic-utils-claude-code",
       "description": "Skills grounded in Claude Code internals",
-      "version": "1.6.0",
+      "version": "1.7.0",
       "source": "./plugins/claude-code",
       "category": "utilities"
     },
@@ -63,13 +63,6 @@
       "version": "3.2.0",
       "source": "./plugins/github",
       "category": "development"
-    },
-    {
-      "name": "agentic-utils-codex",
-      "description": "Delegate self-contained tasks to the Codex CLI",
-      "version": "1.0.0",
-      "source": "./plugins/codex",
-      "category": "utilities"
     }
   ]
 }
