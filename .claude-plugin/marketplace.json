@@ -63,6 +63,13 @@
       "version": "3.2.0",
       "source": "./plugins/github",
       "category": "development"
+    },
+    {
+      "name": "agentic-utils-codex",
+      "description": "Delegate self-contained tasks to the Codex CLI",
+      "version": "1.0.0",
+      "source": "./plugins/codex",
+      "category": "utilities"
     }
   ]
 }
