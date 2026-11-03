@@ -32,8 +32,6 @@ const POLL_MS = Number(process.env.GH_PR_EVENTS_POLL_SECONDS ?? 15) * 1000
 const FORWARD_RETRY_MS = Number(process.env.GH_PR_EVENTS_FORWARD_RETRY_MS ?? 5 * 60_000)
 const FORWARD_RETRY_MAX_MS = Math.max(FORWARD_RETRY_MS, 60 * 60_000)
 const SWEEP_MS = 30 * 60_000 // a polled PR is caught up in full this often even when its probes saw no change
-// gh-webhook's relay; a repo hook pointing here that answered 404 has nobody listening on it
-const RELAY = 'https://webhook-forwarder.github.com/'
 // GitHub refusing the forward: one is allowed per repo and someone else holds it, or we're not admin
 const TAKEN = /already exists/i
 const NO_ADMIN = /HTTP 40[34]|Not Found|admin|Resource not accessible/i
@@ -279,47 +277,43 @@ export async function startDaemon() {
         return `gh webhook forward failed for ${repo}: no admin on the repo`
       }
       if (f.cancelled) return cancelledMsg
-      for (let attempt = 0; ; attempt++) {
-        const p = (f.p = Bun.spawn([bin, 'forward', `--repo=${repo}`, `--events=${events}`, `--url=${url}webhook`, `--secret=${secret}`], {
-          stdout: 'ignore',
-          stderr: 'pipe',
-        }))
-        track(p.pid, p.exited)
-        // read stderr for as long as it runs: a full, unread pipe would block the forwarder
-        let firstLine = ''
-        let all = ''
-        const stderrDone = (async () => {
-          const dec = new TextDecoder()
-          for await (const chunk of p.stderr) {
-            const text = dec.decode(chunk, { stream: true })
-            firstLine ||= text.split('\n')[0]
-            all += text
-            log(`[${repo}]`, text.trimEnd())
-          }
-        })().catch(() => {})
-        if ((await Promise.race([p.exited, Bun.sleep(3000).then(() => null)])) !== null) {
-          if (f.cancelled) return cancelledMsg // stopped on purpose during its start
-          await stderrDone
-          // a forward that died without GitHub deleting its hook blocks every new one: clear those and try once more
-          if (TAKEN.test(all) && !attempt && (await reapDeadHooks(repo)) && !f.cancelled) continue
-          f.refused = TAKEN.test(all) ? 'another forward holds the repo' : NO_ADMIN.test(all) ? 'no admin on the repo' : undefined
-          return `gh webhook forward failed for ${repo}: ${firstLine}`
+      const p = (f.p = Bun.spawn([bin, 'forward', `--repo=${repo}`, `--events=${events}`, `--url=${url}webhook`, `--secret=${secret}`], {
+        stdout: 'ignore',
+        stderr: 'pipe',
+      }))
+      track(p.pid, p.exited)
+      // read stderr for as long as it runs: a full, unread pipe would block the forwarder
+      let firstLine = ''
+      let all = ''
+      const stderrDone = (async () => {
+        const dec = new TextDecoder()
+        for await (const chunk of p.stderr) {
+          const text = dec.decode(chunk, { stream: true })
+          firstLine ||= text.split('\n')[0]
+          all += text
+          log(`[${repo}]`, text.trimEnd())
         }
-        f.up = true
-        const upAt = Date.now()
-        log(`forwarding ${repo} -> ${url}webhook`)
-        // gh-webhook exits on any lost connection (a sleep, a network change), and GitHub deletes its webhook
-        p.exited.then(code =>
-          serial(() => {
-            if (forwarders.get(repo) !== f) return // stopped on purpose
-            forwarders.delete(repo)
-            fellBehind(repo)
-            if (Date.now() - upAt > 60_000) restarts.delete(repo) // it had been working: start counting afresh
-            restartLater(repo, `gh webhook forward for ${repo} exited ${code}`)
-          }),
-        )
-        return null
+      })().catch(() => {})
+      if ((await Promise.race([p.exited, Bun.sleep(3000).then(() => null)])) !== null) {
+        if (f.cancelled) return cancelledMsg // stopped on purpose during its start
+        await stderrDone
+        f.refused = TAKEN.test(all) ? 'another forward holds the repo' : NO_ADMIN.test(all) ? 'no admin on the repo' : undefined
+        return `gh webhook forward failed for ${repo}: ${firstLine}`
       }
+      f.up = true
+      const upAt = Date.now()
+      log(`forwarding ${repo} -> ${url}webhook`)
+      // gh-webhook exits on any lost connection (a sleep, a network change), and GitHub deletes its webhook
+      p.exited.then(code =>
+        serial(() => {
+          if (forwarders.get(repo) !== f) return // stopped on purpose
+          forwarders.delete(repo)
+          fellBehind(repo)
+          if (Date.now() - upAt > 60_000) restarts.delete(repo) // it had been working: start counting afresh
+          restartLater(repo, `gh webhook forward for ${repo} exited ${code}`)
+        }),
+      )
+      return null
     })().catch(e => `gh webhook forward failed for ${repo}: ${e}`)
     f.ready.then(err =>
       serial(() => {
@@ -525,32 +519,6 @@ export async function startDaemon() {
     } catch {
       return undefined
     }
-  }
-
-  // Deletes the repo's gh-webhook hooks that nobody listens on any more, and says whether it deleted any. Dead: its
-  // latest delivery, a minute or more after it was made, got a 404 from the relay (a live forward answers 2xx), or
-  // it is inactive and over an hour old. A forward still starting has had no such delivery, so it is never touched.
-  async function reapDeadHooks(repo: string): Promise<number> {
-    let n = 0
-    try {
-      const hooks: any[] = await api(`repos/${repo}/hooks?per_page=100`, 'list')
-      for (const h of hooks) {
-        if (h?.name !== 'cli' || !String(h.config?.url ?? '').startsWith(RELAY)) continue
-        const made = Date.parse(h.created_at)
-        const [last] = await api(`repos/${repo}/hooks/${h.id}/deliveries?per_page=1`)
-        const dead = last
-          ? last.status_code === 404 && Date.parse(last.delivered_at) - made >= 60_000
-          : !h.active && Date.now() - made >= 60 * 60_000
-        if (!dead) continue
-        const { code, why } = await ghApi(['-X', 'DELETE'], `repos/${repo}/hooks/${h.id}`)
-        if (code !== 0) throw new Error(why)
-        log(`deleted dead forward hook ${h.id} on ${repo}`)
-        n++
-      }
-    } catch (e: any) {
-      log(`could not clear dead forward hooks on ${repo}: ${e?.message ?? e}`)
-    }
-    return n
   }
 
   // Whether the resource changed since the last call, by a conditional GET: GitHub answers an unchanged one with a 304,

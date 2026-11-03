@@ -12,9 +12,7 @@
 // - each repo has at most one forwarder, running exactly while some live session (connected, or closed for less
 //   than the TTL) subscribes to a PR in it; one that exits (as gh-webhook does whenever its connection drops) is
 //   restarted, and its subscriptions dropped only after 10 failed restarts in a row;
-// - a forward is not tried where the repo's permissions say we aren't admin; one refused because a hook exists first
-//   deletes the gh-webhook hooks nobody listens on (latest delivery a 404 from the relay, or inactive for over an
-//   hour) and tries once more, never touching a live forward;
+// - a forward is not tried where the repo's permissions say we aren't admin;
 // - a repo whose forward GitHub refuses (another forward holds it, or no admin) is polled instead: the subscription
 //   still succeeds, its sessions are told once, each PR is probed every 15s with conditional requests (an unchanged
 //   PR costs a 304 and nothing more; GitHub's X-Poll-Interval or Retry-After lengthens the wait) and caught up
