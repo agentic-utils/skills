@@ -1,0 +1,47 @@
+#!/usr/bin/env bun
+// slack-inbox run | check [--config file] [--hours 09:00-18:00] [--days mon-fri] [--log file]
+import { parseArgs } from 'node:util'
+import { loadConfig } from './config'
+import { inHours } from './hours'
+import { run } from './run'
+import { myGroups, socketUrl, whoami } from './slack'
+
+const USAGE = `usage: slack-inbox <run|check> [--config file] [--hours HH:MM-HH:MM] [--days mon-fri] [--log file]
+
+  run    listen and append one JSONL line per matching message to the log
+  check  verify both tokens and the user token's scopes, then exit
+
+Tokens are read from SLACK_INBOX_APP_TOKEN / SLACK_INBOX_USER_TOKEN, or from the
+chmod 600 files named by SLACK_INBOX_APP_TOKEN_FILE / SLACK_INBOX_USER_TOKEN_FILE.`
+
+async function check(flags: Parameters<typeof loadConfig>[0]) {
+  const cfg = loadConfig(flags)
+  const id = await whoami(cfg.userToken)
+  console.log(`user token: ok, user ${id.userId} in ${id.url}`)
+  if (id.missingScopes.length) console.log(`user token: MISSING scopes ${id.missingScopes.join(', ')}`)
+  const groups = await myGroups(cfg.userToken, id.userId)
+  console.log(`user groups: member of ${groups.size}`)
+  await socketUrl(cfg.appToken) // an unused URL just expires
+  console.log('app token: ok, Socket Mode connection allowed')
+  console.log(`log file: ${cfg.logFile}`)
+  console.log(`working hours: ${cfg.hours ? (inHours(cfg.hours, new Date()) ? 'inside now' : 'outside now') : 'always on'}`)
+  if (id.missingScopes.length) process.exit(1)
+}
+
+const { positionals, values } = parseArgs({
+  allowPositionals: true,
+  options: { config: { type: 'string' }, hours: { type: 'string' }, days: { type: 'string' }, log: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+})
+const cmd = positionals[0]
+try {
+  if (values.help || !cmd) console.log(USAGE)
+  else if (cmd === 'run') await run(loadConfig(values))
+  else if (cmd === 'check') await check(values)
+  else {
+    console.error(USAGE)
+    process.exit(2)
+  }
+} catch (e) {
+  console.error(`slack-inbox: ${(e as Error).message}`)
+  process.exit(1)
+}

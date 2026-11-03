@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example LaunchAgent for slack-inbox. Replace every /Users/YOU, check the bun path (`which bun`),
+  set the working hours, then:
+    cp local.slack-inbox.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.slack-inbox.plist
+  launchd keeps the process alive; the process itself disconnects outside the hours and reconnects inside them.
+  launchd does not expand ~ or $HOME, so every path here must be absolute.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.slack-inbox</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/bun</string>
+    <string>/Users/YOU/.claude/plugins/marketplaces/agentic-utils/plugins/slack-inbox/src/cli.ts</string>
+    <string>run</string>
+    <string>--hours</string>
+    <string>09:00-18:00</string>
+    <string>--days</string>
+    <string>mon-fri</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- paths to chmod 600 files holding the tokens, never the tokens themselves -->
+    <key>SLACK_INBOX_APP_TOKEN_FILE</key>
+    <string>/Users/YOU/.config/slack-inbox/app-token</string>
+    <key>SLACK_INBOX_USER_TOKEN_FILE</key>
+    <string>/Users/YOU/.config/slack-inbox/user-token</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- a bad token makes it exit; this caps the restarts at one a minute -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/slack-inbox/listener.log</string>
+</dict>
+</plist>

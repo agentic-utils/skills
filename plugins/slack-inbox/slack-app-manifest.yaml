@@ -1,0 +1,26 @@
+# Slack app manifest for slack-inbox: create the app with "From an app manifest" at https://api.slack.com/apps
+# Read-only by design: user scopes to read the conversations you are in, no bot user, no write scopes.
+display_information:
+  name: Inbox Listener
+  description: Read-only listener that logs Slack messages addressed to you to a local file.
+oauth_config:
+  scopes:
+    user:
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - usergroups:read
+      - users:read
+settings:
+  event_subscriptions:
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
