@@ -7,6 +7,8 @@ export type Sub = { conversation: string; thread_ts?: string; include_own?: bool
 
 export type SessionFile = {
   inbox: boolean
+  // with the inbox: also the user's own messages, everywhere they post
+  inbox_own?: boolean
   conversations: Sub[]
   // where this session has read the log up to, so a resumed session gets what arrived while it was closed
   offset?: number
@@ -56,7 +58,7 @@ export function writeSessionFile(path: string, value: SessionFile) {
 export function readSessionFile(path: string): SessionFile | null {
   try {
     const v = JSON.parse(readFileSync(path, 'utf8'))
-    return { inbox: v.inbox === true, conversations: Array.isArray(v.conversations) ? v.conversations : [], offset: v.offset, ino: v.ino, state: v.state }
+    return { inbox: v.inbox === true, ...(v.inbox_own === true && { inbox_own: true }), conversations: Array.isArray(v.conversations) ? v.conversations : [], offset: v.offset, ino: v.ino, state: v.state }
   } catch {
     return null
   }
@@ -66,14 +68,15 @@ export function readSessionFile(path: string): SessionFile | null {
 // messages there too. Files untouched for the TTL belong to sessions long gone and are skipped.
 export type Watches = Map<string, boolean>
 
-export function readWatches(stateDir: string, now = Date.now()): Watches {
-  const out: Watches = new Map()
+// The files of sessions that are still around: those untouched for the TTL belong to sessions long gone.
+function liveSessions(stateDir: string, now: number): SessionFile[] {
   let names: string[] = []
   try {
     names = readdirSync(subsDir(stateDir)).filter(n => n.endsWith('.json'))
   } catch {
-    return out
+    return []
   }
+  const out: SessionFile[] = []
   for (const n of names) {
     const path = `${subsDir(stateDir)}/${n}`
     try {
@@ -81,7 +84,16 @@ export function readWatches(stateDir: string, now = Date.now()): Watches {
     } catch {
       continue
     }
-    for (const s of readSessionFile(path)?.conversations ?? []) {
+    const f = readSessionFile(path)
+    if (f) out.push(f)
+  }
+  return out
+}
+
+export function readWatches(stateDir: string, now = Date.now()): Watches {
+  const out: Watches = new Map()
+  for (const f of liveSessions(stateDir, now)) {
+    for (const s of f.conversations) {
       if (typeof s?.conversation !== 'string' || !CONVERSATION.test(s.conversation)) continue
       if (s.thread_ts !== undefined && !TS.test(s.thread_ts)) continue
       const k = subKey(s)
@@ -90,6 +102,9 @@ export function readWatches(stateDir: string, now = Date.now()): Watches {
   }
   return out
 }
+
+// Whether some session subscribed to the inbox with include_own, so the listener logs everything the user posts.
+export const wantsOwnInbox = (stateDir: string, now = Date.now()) => liveSessions(stateDir, now).some(f => f.inbox && f.inbox_own === true)
 
 // Deletes files of sessions closed for longer than the TTL.
 export function pruneStale(stateDir: string, now = Date.now()) {

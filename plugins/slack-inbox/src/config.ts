@@ -11,6 +11,7 @@ export type Config = {
   allowBots: Set<string>
   groupRefreshMinutes: number
   previewChars: number
+  includeOwn: boolean
   hours?: Hours
 }
 
@@ -22,6 +23,7 @@ type FileConfig = {
   allow_bots?: string[]
   group_refresh_minutes?: number
   preview_chars?: number
+  include_own?: boolean
   hours?: string
   days?: string
 }
@@ -47,6 +49,14 @@ function token(env: Env, name: string, file: string | undefined, prefix: string,
   if (!value) throw new Error(`no ${what}: set ${name} or ${name}_FILE (a chmod 600 file)`)
   if (!value.startsWith(prefix)) throw new Error(`${name} should start with ${prefix} (${what})`)
   return value
+}
+
+// An on/off setting: env (1/true/yes or 0/false/no) wins over the config file's boolean.
+function flag(v: string | undefined, file: boolean | undefined): boolean {
+  if (v === undefined || v === '') return file === true
+  if (/^(1|true|yes|on)$/i.test(v)) return true
+  if (/^(0|false|no|off)$/i.test(v)) return false
+  throw new Error(`bad on/off value ${v}`)
 }
 
 export type Flags = { config?: string; hours?: string; days?: string; log?: string }
@@ -97,6 +107,7 @@ export function loadConfig(flags: Flags, env: Env = process.env): Config {
     allowBots: new Set(allow.map(s => s.trim()).filter(Boolean)),
     groupRefreshMinutes: num(env.SLACK_INBOX_GROUP_REFRESH_MINUTES ?? file.group_refresh_minutes, 30, 1),
     previewChars: num(env.SLACK_INBOX_PREVIEW_CHARS ?? file.preview_chars, 200, 20),
+    includeOwn: flag(env.SLACK_INBOX_INCLUDE_OWN, file.include_own),
     hours: hours ? parseHours(hours, days) : undefined,
   }
 }

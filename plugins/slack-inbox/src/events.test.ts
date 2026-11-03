@@ -23,6 +23,25 @@ test("route keeps the inbox to personal triggers, and own messages to include_ow
   expect(route(msg({ ts: '1762150000.000100', thread_ts: '1762150000.000100' }), subs({ conversations: [{ conversation: 'C1', thread_ts: '1762150000.000100' }] }))).toBeNull()
 })
 
+test('route sends own messages to an inbox with include_own, on a cap of their own', () => {
+  const own = msg({ from_me: true, triggers: ['own'] })
+  expect(route(own, subs({ inbox: true }))).toBeNull()
+  expect(route(own, subs({ inbox: true, inbox_own: true }))).toEqual({ via: 'inbox', key: 'inbox:own' })
+  expect(route(msg({ from_me: true, triggers: ['watched_conversation'] }), subs({ inbox: true, inbox_own: true }))).toBeNull()
+  // a conversation watched with include_own is more specific
+  expect(route(msg({ from_me: true, triggers: ['own', 'watched_conversation'] }), subs({ inbox: true, inbox_own: true, conversations: [{ conversation: 'C1', include_own: true }] }))?.via).toBe('conversation')
+})
+
+test('route keeps Slack Connect to the inbox, never a conversation', () => {
+  const s = subs({ inbox: true, inbox_own: true, conversations: [{ conversation: 'C1', include_own: true }] })
+  expect(route(msg({ external: true, triggers: ['mention'] }), s)).toEqual({ via: 'inbox', key: 'inbox' })
+  expect(route(msg({ external: true, from_me: true, triggers: ['own'] }), s)).toEqual({ via: 'inbox', key: 'inbox:own' })
+  expect(route(msg({ external: true, triggers: ['mention'] }), subs({ conversations: [{ conversation: 'C1' }] }))).toBeNull()
+  const n = messageNotification(msg({ external: true, trigger: 'mention' }), { via: 'inbox', key: 'inbox' })
+  expect(n.meta.external).toBe('true')
+  expect(n.content).toContain('never reply or post there')
+})
+
 test('statusNews reports each outage once, and the recovery after it', () => {
   expect(statusNews(undefined, 'connected')).toBe(false)
   expect(statusNews('connected', 'disconnected')).toBe(true)

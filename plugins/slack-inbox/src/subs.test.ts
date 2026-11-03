@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { mkdtempSync, existsSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { ensureSubsDir, parseTarget, pruneStale, readWatches, SESSION_TTL_MS, subsDir, writeSessionFile } from './subs'
+import { ensureSubsDir, parseTarget, pruneStale, readSessionFile, readWatches, SESSION_TTL_MS, subsDir, wantsOwnInbox, writeSessionFile } from './subs'
 
 test('parseTarget takes ids and message links', () => {
   expect(parseTarget('C0123ABC')).toEqual({ conversation: 'C0123ABC' })
@@ -31,4 +31,18 @@ test('readWatches unions live sessions, ORs include_own, and skips stale or bad 
   expect(existsSync(`${subsDir(dir)}/old.json`)).toBe(false)
   expect(existsSync(`${subsDir(dir)}/a.json`)).toBe(true)
   expect(readWatches(`${dir}/missing`).size).toBe(0)
+})
+
+test('wantsOwnInbox is true only while a live session has the inbox with include_own', () => {
+  const dir = mkdtempSync(`${tmpdir()}/slack-subs-`)
+  ensureSubsDir(dir)
+  writeSessionFile(`${subsDir(dir)}/a.json`, { inbox: true, conversations: [] })
+  expect(wantsOwnInbox(dir)).toBe(false)
+  writeSessionFile(`${subsDir(dir)}/b.json`, { inbox: true, inbox_own: true, conversations: [] })
+  expect(wantsOwnInbox(dir)).toBe(true)
+  expect(readSessionFile(`${subsDir(dir)}/b.json`)?.inbox_own).toBe(true)
+  const old = (Date.now() - SESSION_TTL_MS - 60_000) / 1000
+  utimesSync(`${subsDir(dir)}/b.json`, old, old)
+  expect(wantsOwnInbox(dir)).toBe(false)
+  expect(wantsOwnInbox(`${dir}/missing`)).toBe(false)
 })

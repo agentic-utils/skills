@@ -2,7 +2,7 @@
 import { afterAll, expect, test } from 'bun:test'
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { readWatches, subsDir } from './subs'
+import { readWatches, subsDir, wantsOwnInbox } from './subs'
 
 const dir = mkdtempSync(`${tmpdir()}/slack-channel-`)
 const logFile = `${dir}/events.jsonl`
@@ -118,6 +118,31 @@ test('the inbox gets messages and outages, and a resumed session gets what it mi
   await s.start()
   const [e] = await s.until(() => (s.events().length ? s.events() : undefined))
   expect(e.content).toContain('while closed')
+  await s.tool('unsubscribe_inbox')
+  await s.stop()
+})
+
+test('the inbox with include_own gets own posts on their own cap, flagged via_claude and external', async () => {
+  const s = server('s-own', { SLACK_INBOX_RATE_PER_MINUTE: '2' })
+  await s.start()
+  const r = await s.tool('subscribe_inbox', { include_own: true })
+  expect(r.content[0].text).toContain('inbox (with own)')
+  expect(wantsOwnInbox(dir)).toBe(true)
+  const own = (i: number, extra = {}) => msg({ channel: 'D1AB', trigger: 'own', triggers: ['own'], from_me: true, ts: `1762160002.00000${i}`, ...extra })
+  line(own(0, { via_claude: true }))
+  line(own(1))
+  line(own(2)) // over the own cap
+  line(msg({ ts: '1762160002.000009', text: 'to you', external: true }))
+  await s.until(() => (s.events().length === 3 ? true : undefined))
+  await Bun.sleep(200)
+  const ev = s.events()
+  expect(ev).toHaveLength(3)
+  expect(ev[0].meta).toMatchObject({ via: 'inbox', trigger: 'own', via_claude: 'true' })
+  expect(ev[0].content).toContain('posted by a Claude session')
+  expect(ev[1].meta.via_claude).toBeUndefined()
+  expect(ev[2].meta).toMatchObject({ trigger: 'dm', external: 'true' }) // the addressed cap is untouched
+  await s.tool('subscribe_inbox')
+  expect(wantsOwnInbox(dir)).toBe(false)
   await s.tool('unsubscribe_inbox')
   await s.stop()
 })

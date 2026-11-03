@@ -11,7 +11,7 @@ const event = (m: Partial<SlackMessage>, p: Partial<EventsApiPayload> = {}): Eve
   ...p,
 })
 
-function setup(watches: Watches = new Map(), inThread = false) {
+function setup(watches: Watches = new Map(), inThread = false, logOwn = false) {
   const out: Record<string, any>[] = []
   const lookups: string[] = []
   const handle = createHandler({
@@ -23,6 +23,7 @@ function setup(watches: Watches = new Map(), inThread = false) {
     userInThread: async (c, t) => (lookups.push(`${c}:${t}`), inThread),
     remember: () => {},
     watches: () => watches,
+    logOwn: () => logOwn,
     userName: async id => `name-${id}`,
     emit: r => out.push(r),
   })
@@ -71,6 +72,42 @@ test("the user's own messages are logged only where a session asked for them", a
   const withOwn = setup(new Map([['C1', true]]))
   await withOwn.handle(event({ user: 'UME' }))
   expect(withOwn.out[0]).toMatchObject({ triggers: ['watched_conversation'], from_me: true })
+})
+
+test('with logOwn, every message the user posts is logged as trigger own, self-DM and threads included', async () => {
+  const s = setup(new Map(), false, true)
+  await s.handle(event({ user: 'UME', channel: 'D1', channel_type: 'im', ts: '1762160000.000600' }))
+  await s.handle(event({ user: 'UME', channel: 'C5', ...reply, ts: '1762160000.000700' }))
+  await s.handle(event({ user: 'UME', channel: 'G1', channel_type: 'mpim', ts: '1762160000.000800', text: 'ok\n_✨ via <https://claude.ai/code/session_x|Claude session>_' }))
+  expect(s.out.map(r => [r.channel, r.trigger, r.from_me, r.via_claude])).toEqual([
+    ['D1', 'own', true, undefined],
+    ['C5', 'own', true, undefined],
+    ['G1', 'own', true, true],
+  ])
+})
+
+test('with logOwn and a watch with include_own, both triggers are kept and own leads', async () => {
+  const s = setup(new Map([['C1', true]]), false, true)
+  await s.handle(event({ user: 'UME' }))
+  expect(s.out[0]).toMatchObject({ trigger: 'own', triggers: ['own', 'watched_conversation'] })
+})
+
+test('Slack Connect is logged, flagged external, only when addressed to the user or their own post', async () => {
+  const ext = { is_ext_shared_channel: true }
+  const s = setup(new Map([['C1', true]]), false, true)
+  await s.handle(event({}, ext)) // watched, but not addressed to the user: dropped
+  await s.handle(event({ text: 'hi <@UME>', ts: '1762160000.000400' }, ext))
+  await s.handle(event({ channel: 'D9', channel_type: 'im', ts: '1762160000.000500' }, ext))
+  await s.handle(event({ user: 'UME', ts: '1762160000.000600' }, ext))
+  await s.handle(event({ bot_id: 'B1', text: 'hi <@UME>', ts: '1762160000.000700' }, ext))
+  expect(s.out.map(r => [r.triggers, r.external])).toEqual([
+    [['mention'], true],
+    [['dm'], true],
+    [['own'], true],
+  ])
+  const off = setup(new Map([['C1', true]]))
+  await off.handle(event({ user: 'UME' }, ext))
+  expect(off.out).toEqual([])
 })
 
 test('Slack Connect and unlisted bots stay out of watched conversations', async () => {

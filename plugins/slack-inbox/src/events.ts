@@ -18,6 +18,8 @@ export type LogRecord = {
   author?: { id?: string; name?: string }
   text?: string
   from_me?: boolean
+  via_claude?: boolean
+  external?: boolean
 }
 
 export type Via = 'thread' | 'conversation' | 'inbox'
@@ -27,10 +29,18 @@ export type Route = { via: Via; key: string }
 const PERSONAL = new Set(['dm', 'group_dm', 'mention', 'group_mention', 'thread_reply'])
 
 // The most specific subscription of this session a message belongs to, or null. The user's own messages only
-// reach a subscription made with include_own, and never the inbox.
+// reach a subscription made with include_own: a conversation or thread, or the inbox, where they get a cap of their
+// own (key `inbox:own`) so a burst of the user's posts never crowds out messages addressed to them.
 export function route(r: LogRecord, s: SessionFile): Route | null {
   if (r.kind !== 'message' || typeof r.channel !== 'string') return null
   const own = r.from_me === true
+  // Slack Connect goes to the inbox only: it is read-only, for the user's eyes, never a conversation to work in
+  if (r.external === true) {
+    if (!s.inbox) return null
+    if (!own && (r.triggers ?? []).some(t => PERSONAL.has(t))) return { via: 'inbox', key: 'inbox' }
+    if (own && s.inbox_own && (r.triggers ?? []).includes('own')) return { via: 'inbox', key: 'inbox:own' }
+    return null
+  }
   const reply = typeof r.thread_ts === 'string' && r.thread_ts !== r.ts
   for (const sub of s.conversations) {
     if (sub.thread_ts && reply && sub.conversation === r.channel && sub.thread_ts === r.thread_ts && (!own || sub.include_own))
@@ -40,6 +50,7 @@ export function route(r: LogRecord, s: SessionFile): Route | null {
     if (!sub.thread_ts && sub.conversation === r.channel && (!own || sub.include_own)) return { via: 'conversation', key: subKey(sub) }
   }
   if (s.inbox && !own && (r.triggers ?? []).some(t => PERSONAL.has(t))) return { via: 'inbox', key: 'inbox' }
+  if (s.inbox && s.inbox_own && own && (r.triggers ?? []).includes('own')) return { via: 'inbox', key: 'inbox:own' }
   return null
 }
 
@@ -61,11 +72,12 @@ const meta = (m: Record<string, unknown>) => {
 }
 
 export function messageNotification(r: LogRecord, route: Route): Notification {
-  const who = r.from_me ? 'you' : `${r.author?.name ?? 'unknown'} (${r.author?.id ?? '?'})`
+  const who = r.from_me ? `you${r.via_claude ? ' (posted by a Claude session)' : ''}` : `${r.author?.name ?? 'unknown'} (${r.author?.id ?? '?'})`
   const where = r.thread_ts && r.thread_ts !== r.ts ? `thread ${r.thread_ts} in ${r.channel}` : r.channel
+  const ext = r.external ? ' [Slack Connect, external: read-only, tell the user only, never reply or post there]' : ''
   return {
-    content: `${r.trigger ?? 'message'} from ${who} in ${where}: ${r.text ?? ''}\n${r.permalink ?? ''}`.trim(),
-    meta: meta({ event: 'message', via: route.via, trigger: r.trigger, channel: r.channel, ts: r.ts, thread_ts: r.thread_ts }),
+    content: `${r.trigger ?? 'message'} from ${who} in ${where}${ext}: ${r.text ?? ''}\n${r.permalink ?? ''}`.trim(),
+    meta: meta({ event: 'message', via: route.via, trigger: r.trigger, channel: r.channel, ts: r.ts, thread_ts: r.thread_ts, via_claude: r.via_claude ? 'true' : undefined, external: r.external ? 'true' : undefined }),
   }
 }
 

@@ -6,6 +6,7 @@ import { inHours } from './hours'
 import {
   type EventsApiPayload,
   type Me,
+  PERSONAL,
   PRIORITY,
   type SlackMessage,
   type Trigger,
@@ -15,10 +16,11 @@ import {
   screen,
   threadKey,
   triggers,
+  viaClaude,
   watched,
 } from './match'
 import { inThread, myGroups, socketUrl, userName, whoami } from './slack'
-import { readWatches, type Watches } from './subs'
+import { readWatches, type Watches, wantsOwnInbox } from './subs'
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack-inbox]', ...a)
 
@@ -66,9 +68,14 @@ export type HandlerDeps = {
   userInThread: (channel: string, threadTs: string) => Promise<boolean>
   remember: (threadKey: string) => void
   watches: () => Watches
+  // whether to log every message the user posts, not only where a session watches with include_own
+  logOwn: () => boolean
   userName: (id: string) => Promise<string>
   emit: (record: Record<string, unknown>) => void
 }
+
+// Slack Connect keeps only what is addressed to the user, or is their own post.
+const keep = (hit: Trigger[], external: boolean) => (external ? hit.filter(t => PERSONAL.has(t)) : hit)
 
 // Turns one Socket Mode event into at most one log record. No socket, no clock: the deps are all it touches.
 export function createHandler(d: HandlerDeps) {
@@ -79,7 +86,7 @@ export function createHandler(d: HandlerDeps) {
     if (seen.size > 5000) seen.delete(seen.values().next().value!)
     return true
   }
-  const record = async (m: SlackMessage, hit: Trigger[], own: boolean) => {
+  const record = async (m: SlackMessage, hit: Trigger[], own: boolean, external: boolean) => {
     const author = m.user ?? m.bot_id ?? 'unknown'
     d.emit({
       kind: 'message',
@@ -93,6 +100,8 @@ export function createHandler(d: HandlerDeps) {
       author: { id: author, name: m.user ? await d.userName(m.user) : author },
       text: preview(m.text, d.previewChars),
       ...(own && { from_me: true }),
+      ...(external && { external: true }),
+      ...(viaClaude(m.text) && { via_claude: true }),
     })
   }
 
@@ -102,17 +111,17 @@ export function createHandler(d: HandlerDeps) {
     if ('skip' in s) {
       if (s.skip !== 'own') return
       if (s.thread) d.remember(s.thread)
-      // the user's own message: logged only where a session subscribed with include_own
+      // the user's own message: logged when the listener wants all of them, or where a session subscribed with include_own
       const m = payload.event!
-      const hit = watched(m, d.watches(), true)
-      if (hit.length && firstSighting(`${m.channel}:${m.ts}`)) await record(m, hit, true)
+      const hit = keep([...(d.logOwn() ? (['own'] as const) : []), ...watched(m, d.watches(), true)], s.external)
+      if (hit.length && firstSighting(`${m.channel}:${m.ts}`)) await record(m, hit, true, s.external)
       return
     }
     const m = s.message
     if (!firstSighting(`${m.channel}:${m.ts}`)) return
     const inT = needsThreadLookup(m, d.me) ? await d.userInThread(m.channel, m.thread_ts!) : false
-    const hit = triggers(m, d.me, d.groups(), inT, d.watches())
-    if (hit.length) await record(m, hit, false)
+    const hit = keep(triggers(m, d.me, d.groups(), inT, d.watches()), s.external)
+    if (hit.length) await record(m, hit, false, s.external)
   }
 }
 
@@ -185,7 +194,15 @@ export async function run(cfg: Config) {
   }
 
   let watches: Watches = new Map()
+  let ownInbox = false
   let watchesAt = 0
+  const refresh = () => {
+    if (Date.now() - watchesAt > 2000) {
+      watches = readWatches(cfg.stateDir)
+      ownInbox = wantsOwnInbox(cfg.stateDir)
+      watchesAt = Date.now()
+    }
+  }
   const handle = createHandler({
     me,
     teamUrl: id.url,
@@ -195,13 +212,8 @@ export async function run(cfg: Config) {
     userInThread,
     remember,
     // sessions change their subscriptions at any time; a couple of seconds' staleness is fine
-    watches: () => {
-      if (Date.now() - watchesAt > 2000) {
-        watches = readWatches(cfg.stateDir)
-        watchesAt = Date.now()
-      }
-      return watches
-    },
+    watches: () => (refresh(), watches),
+    logOwn: () => cfg.includeOwn || (refresh(), ownInbox),
     userName: id => userName(cfg.userToken, id),
     emit,
   })

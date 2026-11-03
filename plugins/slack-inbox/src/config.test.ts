@@ -41,6 +41,14 @@ test('tokens from env, and prefix checked', () => {
   expect(() => loadConfig({}, { ...base, SLACK_INBOX_APP_TOKEN: 'xapp-1' })).toThrow(/SLACK_INBOX_USER_TOKEN/)
 })
 
+test('SLACK_INBOX_INCLUDE_OWN switches on logging every message the user posts', () => {
+  const env = { ...base, SLACK_INBOX_APP_TOKEN: 'xapp-1', SLACK_INBOX_USER_TOKEN: 'xoxp-1' }
+  expect(loadConfig({}, env).includeOwn).toBe(false)
+  expect(loadConfig({}, { ...env, SLACK_INBOX_INCLUDE_OWN: '1' }).includeOwn).toBe(true)
+  expect(loadConfig({}, { ...env, SLACK_INBOX_INCLUDE_OWN: 'false' }).includeOwn).toBe(false)
+  expect(() => loadConfig({}, { ...env, SLACK_INBOX_INCLUDE_OWN: 'maybe' })).toThrow(/on\/off/)
+})
+
 test('token files must be private', () => {
   const f = `${dir}/user-token`
   writeFileSync(f, 'xoxp-2\n')
