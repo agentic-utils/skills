@@ -28,6 +28,14 @@ A message is logged when it is any of:
 | `group_mention` | A message that mentions a user group you belong to (`<!subteam^ID>`) |
 | `thread_reply`  | A new reply in a thread you started or have replied in               |
 
+Your own posts add one more, when asked for: set `SLACK_INBOX_INCLUDE_OWN=1` on the listener, or have a session call `subscribe_inbox` with `include_own: true`:
+
+| `trigger` | When                                                                                                   |
+| --------- | ------------------------------------------------------------------------------------------------------ |
+| `own`     | A message you posted anywhere you are: DMs (your self-DM included), group DMs, channels and threads |
+
+Such a record has `"from_me":true`. Any record whose text ends with the attribution line a Claude session adds when it posts as you (`_✨ via <…|Claude session>_`) also has `"via_claude":true`, so a coordinating session can skip its own posts.
+
 A session's subscriptions add two more, logged whether or not the message is addressed to you:
 
 | `trigger`              | When                                                                                        |
@@ -37,10 +45,14 @@ A session's subscriptions add two more, logged whether or not the message is add
 
 And it is never logged when it is:
 
-- your own message (it still teaches the listener which threads you are in), unless a session subscribed to that conversation or thread with `include_own`; such a record has `"from_me":true`
+- your own message (it still teaches the listener which threads you are in), unless own messages were asked for (above) or a session subscribed to that conversation or thread with `include_own`; such a record has `"from_me":true`
 - from a bot, Slackbot included, unless that bot's `bot_id`, `app_id` or user id is on the allow-list
-- in a Slack Connect channel or DM, or from a user of another organisation
+- in a Slack Connect channel or DM, or from a user of another organisation, unless it is addressed to you (a DM, group DM, mention or reply in your thread) or is your own post with own messages on (see below)
 - an edit, a deletion, a join or leave, or any other non-message subtype
+
+### Slack Connect is read-only
+
+A message from a Slack Connect conversation, or from a user of another organisation, is logged only for the personal triggers and `own`, never for a session's `watched_*` subscription, and carries `"external":true`. Those conversations include people outside your organisation: a consumer must never reply or post in them, and must route such a record to you alone, never to a session that works on it in Slack. The channel server pushes them only to the inbox, with the same warning in the event text.
 
 Your user groups are fetched at start-up and every 30 minutes (`usergroups.list`), so a group you join is picked up within that time. Threads you take part in are remembered for 30 days in the state directory. For a reply in a thread the listener hasn't seen you in, it asks Slack once (`conversations.replies`) and caches a "no" for 10 minutes.
 
@@ -118,6 +130,7 @@ Tokens come only from the environment or from 0600 files, never from the command
 | Working days (`--days`)   | `SLACK_INBOX_DAYS`                                        | `days`                  | `mon-fri` (only used with hours)                                                             |
 | Group refresh (minutes)   | `SLACK_INBOX_GROUP_REFRESH_MINUTES`                       | `group_refresh_minutes` | 30                                                                                           |
 | Preview length (chars)    | `SLACK_INBOX_PREVIEW_CHARS`                               | `preview_chars`         | 200                                                                                          |
+| Log all your own posts    | `SLACK_INBOX_INCLUDE_OWN` (`1` or `0`)                    | `include_own` (bool)    | off (a session's `subscribe_inbox {include_own: true}` also turns it on)                     |
 
 Flags beat env, env beats the config file. The config file is `~/.config/slack-inbox/config.json`, or the path in `--config` / `SLACK_INBOX_CONFIG`:
 
@@ -167,7 +180,7 @@ claude --channels plugin:agentic-utils-slack-inbox@agentic-utils
 
 Events arrive as `<channel source="plugin:agentic-utils-slack-inbox:slack-events" event="message" via="inbox|conversation|thread" channel="…" thread_ts="…">`, with the author, text and permalink as the body. Only what the session subscribed to arrives:
 
-- `subscribe_inbox` / `unsubscribe_inbox`: every message addressed to you (the first table above). For a coordinating session.
+- `subscribe_inbox` / `unsubscribe_inbox`: every message addressed to you (the first table above). For a coordinating session. `include_own: true` adds every message you post, anywhere, as `trigger="own"`; the listener starts logging them as soon as one live session asks, whatever `SLACK_INBOX_INCLUDE_OWN` says. Events posted by a Claude session as you carry `via_claude="true"`, and Slack Connect ones `external="true"`.
 - `subscribe_conversation` / `unsubscribe_conversation`: with `conversation` alone, every new message and reply in that channel, private channel, DM or group DM; with `thread_ts`, or a message link, every new reply in that thread. `include_own: true` adds your own messages.
 
 `conversation` is an id (`C…`, `G…`, `D…`) or a Slack message link. A link names a thread: the one the message is in, or the one it starts. Subscribing checks with `conversations.info` that you are a member and that it isn't Slack Connect, and refuses otherwise. That needs the user scopes `channels:read`, `groups:read`, `im:read` and `mpim:read` (in the manifest); where the token lacks one the subscription is accepted with a "not verified" note. The check reads the user token from `SLACK_INBOX_USER_TOKEN(_FILE)`, the config file's `user_token_file`, or `~/.config/slack-inbox/user-token`.
@@ -175,7 +188,7 @@ Events arrive as `<channel source="plugin:agentic-utils-slack-inbox:slack-events
 Also pushed, to every session with a subscription:
 
 - `event="status"` when the listener disconnects, pauses, stops or is found not running (its pid is checked every 30 seconds), and when it is connected again, so silence is never mistaken for an empty inbox;
-- `event="rate_limited"` when a subscription goes over its cap: at most 20 pushes per subscription per minute (`SLACK_INBOX_RATE_PER_MINUTE`), the rest counted and reported once that minute is up. A busy channel can still be dozens of events an hour; prefer a thread subscription where one will do.
+- `event="rate_limited"` when a subscription goes over its cap: at most 20 pushes per subscription per minute (`SLACK_INBOX_RATE_PER_MINUTE`), the rest counted and reported once that minute is up. A busy channel can still be dozens of events an hour; prefer a thread subscription where one will do. The inbox's own messages have a cap of their own (`subscription="inbox:own"`), so a burst of your posts never crowds out messages addressed to you; what goes over it is only counted, so read Slack if those matter.
 
 Subscriptions belong to the session. Each lives in `<state dir>/subscriptions/<session id>.json` with the session's place in the log, so they survive `--resume` and anything logged while the session was closed arrives when it comes back (subject to the cap). A session closed for 72 hours is forgotten. The listener reads the same files to know what to log beyond your own triggers, so the channel server resolves the log and state paths exactly as the listener does: if you change them, set them in the config file, not only in the LaunchAgent's environment.
 
@@ -184,6 +197,8 @@ Event text and author names are written by other people. The server's instructio
 ### A coordinating session
 
 Call `subscribe_inbox` once. Each `via="inbox"` event is a message addressed to you; route it to the session that owns that work, or start one, and tell that session the thread's permalink. A `status` event means messages may be missing until the next `connected`.
+
+With `include_own: true` it also sees what you post, including notes to yourself in your self-DM, as `trigger="own"`. Skip the ones with `via_claude="true"`: those are posts a Claude session made as you, quite possibly this one. An `external="true"` event is Slack Connect: tell you about it, and never reply or post there, or hand it to another session.
 
 ### A session working one thread
 

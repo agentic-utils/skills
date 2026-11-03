@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { type EventsApiPayload, type Me, type SlackMessage, needsThreadLookup, permalink, preview, screen, triggers } from './match'
+import { type EventsApiPayload, type Me, type SlackMessage, needsThreadLookup, permalink, preview, screen, triggers, viaClaude } from './match'
 
 const me: Me = { userId: 'UME', teamId: 'T1' }
 const msg = (m: Partial<SlackMessage>): SlackMessage => ({ type: 'message', channel: 'C1', channel_type: 'channel', user: 'UOTHER', ts: '100.000200', text: '', ...m })
@@ -7,16 +7,18 @@ const payload = (m: Partial<SlackMessage>, p: Partial<EventsApiPayload> = {}): E
 const none = new Set<string>()
 const hits = (m: Partial<SlackMessage>, groups = none, inThread = false) => triggers(msg(m), me, groups, inThread)
 
-test('screen drops own, bots, edits and Slack Connect', () => {
-  expect(screen(payload({ user: 'UME', thread_ts: '1.0' }), me, none)).toEqual({ skip: 'own', thread: 'C1:1.0' })
-  expect(screen(payload({ user: 'UME' }), me, none)).toEqual({ skip: 'own', thread: undefined })
+test('screen drops own, bots and edits, and flags Slack Connect', () => {
+  expect(screen(payload({ user: 'UME', thread_ts: '1.0' }), me, none)).toEqual({ skip: 'own', thread: 'C1:1.0', external: false })
+  expect(screen(payload({ user: 'UME' }), me, none)).toEqual({ skip: 'own', thread: undefined, external: false })
+  expect(screen(payload({ user: 'UME' }, { is_ext_shared_channel: true }), me, none)).toEqual({ skip: 'own', thread: undefined, external: true })
   expect(screen(payload({ bot_id: 'B1' }), me, none)).toEqual({ skip: 'bot' })
   expect(screen(payload({ subtype: 'bot_message', bot_id: 'B1', user: undefined }), me, none)).toEqual({ skip: 'bot' })
   expect(screen(payload({ user: 'USLACKBOT' }), me, none)).toEqual({ skip: 'bot' })
   expect(screen(payload({ subtype: 'message_changed' }), me, none)).toEqual({ skip: 'subtype' })
   expect(screen(payload({ subtype: 'channel_join' }), me, none)).toEqual({ skip: 'subtype' })
-  expect(screen(payload({}, { is_ext_shared_channel: true }), me, none)).toEqual({ skip: 'external' })
-  expect(screen(payload({ user_team: 'T2' }), me, none)).toEqual({ skip: 'external' })
+  expect(screen(payload({}, { is_ext_shared_channel: true }), me, none)).toMatchObject({ external: true })
+  expect(screen(payload({ user_team: 'T2' }), me, none)).toMatchObject({ external: true })
+  expect(screen(payload({ bot_id: 'B1' }, { is_ext_shared_channel: true }), me, none)).toEqual({ skip: 'bot' })
   expect(screen({ type: 'event_callback', event: { ...msg({}), type: 'reaction_added' } }, me, none)).toEqual({ skip: 'not_message' })
 })
 
@@ -25,7 +27,15 @@ test('screen keeps people, allow-listed bots and Grid colleagues', () => {
   expect('message' in screen(payload({ subtype: 'thread_broadcast' }), me, none)).toBe(true)
   expect('message' in screen(payload({ bot_id: 'B1' }), me, new Set(['B1']))).toBe(true)
   expect('message' in screen(payload({ bot_id: 'B9', bot_profile: { app_id: 'A1' } }), me, new Set(['A1']))).toBe(true)
-  expect('message' in screen(payload({ user_team: 'T2' }), { ...me, enterpriseId: 'E1' }, none)).toBe(true)
+  expect(screen(payload({ user_team: 'T2' }), { ...me, enterpriseId: 'E1' }, none)).toMatchObject({ external: false })
+})
+
+test('viaClaude spots the attribution line a Claude session ends a post with', () => {
+  expect(viaClaude('done\n_✨ via <https://claude.ai/code/session_x|Claude session>_')).toBe(true)
+  expect(viaClaude('done _✨ via <t3code://threads/a/b|Claude session>_ \n')).toBe(true)
+  expect(viaClaude('_✨ via <https://claude.ai/code/session_x|Claude session>_ and then more')).toBe(false)
+  expect(viaClaude('via Claude session')).toBe(false)
+  expect(viaClaude(undefined)).toBe(false)
 })
 
 test('triggers', () => {
