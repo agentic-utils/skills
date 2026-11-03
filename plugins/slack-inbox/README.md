@@ -1,12 +1,12 @@
 # slack-inbox
 
-A read-only Slack listener for a coordinating Claude session. It holds a [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode) connection open during your working hours and appends one JSONL line to a log file for every message addressed to you. A session watches that file with `tail -F` in a Monitor and decides what to do with each line. The listener never posts, reacts or edits anything in Slack.
+A read-only Slack listener for Claude sessions. It holds a [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode) connection open during your working hours and appends one JSONL line to a log file for every message addressed to you, and for every message in conversations or threads a session has subscribed to. The plugin's channel server, `slack-events`, pushes those lines into each subscribed session as they arrive, the way `pr-events` does for pull requests. Nothing here posts, reacts or edits anything in Slack.
 
 ## Skills
 
 | Skill         | Trigger phrases                                                                          | Description                                                       |
 | ------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `slack-inbox` | "set up slack inbox", "watch my slack inbox", "monitor slack messages", "slack listener" | Set up the listener, check it, and consume its log from a Monitor |
+| `slack-inbox` | "set up slack inbox", "watch my slack inbox", "monitor slack messages", "slack listener" | Set up the listener, check it, and subscribe sessions to its events |
 
 ## Install
 
@@ -28,9 +28,16 @@ A message is logged when it is any of:
 | `group_mention` | A message that mentions a user group you belong to (`<!subteam^ID>`) |
 | `thread_reply`  | A new reply in a thread you started or have replied in               |
 
+A session's subscriptions add two more, logged whether or not the message is addressed to you:
+
+| `trigger`              | When                                                                                        |
+| ---------------------- | ------------------------------------------------------------------------------------------- |
+| `watched_thread`       | A new reply in a thread some session subscribed to, including threads you are not in        |
+| `watched_conversation` | A new message or reply in a channel, DM or group DM some session subscribed to              |
+
 And it is never logged when it is:
 
-- your own message (it still teaches the listener which threads you are in)
+- your own message (it still teaches the listener which threads you are in), unless a session subscribed to that conversation or thread with `include_own`; such a record has `"from_me":true`
 - from a bot, Slackbot included, unless that bot's `bot_id`, `app_id` or user id is on the allow-list
 - in a Slack Connect channel or DM, or from a user of another organisation
 - an edit, a deletion, a join or leave, or any other non-message subtype
@@ -148,9 +155,43 @@ launchctl bootout gui/$(id -u)/local.slack-inbox        # stop and unload
 
 It points at the marketplace checkout (`~/.claude/plugins/marketplaces/agentic-utils/…`), which `/plugin marketplace update` keeps current; restart the agent after an update.
 
-## Consume the log from a coordinator session
+## Push events into sessions
 
-A coordinating Claude session runs this in a Monitor (each output line becomes an event in the session):
+The plugin ships a [channel](https://code.claude.com/docs/en/channels) MCP server, `slack-events`. It does not open its own Slack connection: it tails the listener's log, so the LaunchAgent stays the only Socket Mode client. Load the plugin as a channel when starting Claude Code:
+
+```bash
+claude --channels plugin:agentic-utils-slack-inbox@agentic-utils
+```
+
+`--channels` takes several sources, so a session can load this next to `plugin:agentic-utils-github@agentic-utils`. Without the flag the tools still exist but no events arrive.
+
+Events arrive as `<channel source="plugin:agentic-utils-slack-inbox:slack-events" event="message" via="inbox|conversation|thread" channel="…" thread_ts="…">`, with the author, text and permalink as the body. Only what the session subscribed to arrives:
+
+- `subscribe_inbox` / `unsubscribe_inbox`: every message addressed to you (the first table above). For a coordinating session.
+- `subscribe_conversation` / `unsubscribe_conversation`: with `conversation` alone, every new message and reply in that channel, private channel, DM or group DM; with `thread_ts`, or a message link, every new reply in that thread. `include_own: true` adds your own messages.
+
+`conversation` is an id (`C…`, `G…`, `D…`) or a Slack message link. A link names a thread: the one the message is in, or the one it starts. Subscribing checks with `conversations.info` that you are a member and that it isn't Slack Connect, and refuses otherwise. That needs the user scopes `channels:read`, `groups:read`, `im:read` and `mpim:read` (in the manifest); where the token lacks one the subscription is accepted with a "not verified" note. The check reads the user token from `SLACK_INBOX_USER_TOKEN(_FILE)`, the config file's `user_token_file`, or `~/.config/slack-inbox/user-token`.
+
+Also pushed, to every session with a subscription:
+
+- `event="status"` when the listener disconnects, pauses, stops or is found not running (its pid is checked every 30 seconds), and when it is connected again, so silence is never mistaken for an empty inbox;
+- `event="rate_limited"` when a subscription goes over its cap: at most 20 pushes per subscription per minute (`SLACK_INBOX_RATE_PER_MINUTE`), the rest counted and reported once that minute is up. A busy channel can still be dozens of events an hour; prefer a thread subscription where one will do.
+
+Subscriptions belong to the session. Each lives in `<state dir>/subscriptions/<session id>.json` with the session's place in the log, so they survive `--resume` and anything logged while the session was closed arrives when it comes back (subject to the cap). A session closed for 72 hours is forgotten. The listener reads the same files to know what to log beyond your own triggers, so the channel server resolves the log and state paths exactly as the listener does: if you change them, set them in the config file, not only in the LaunchAgent's environment.
+
+Event text and author names are written by other people. The server's instructions tell Claude to treat them as information, never as instructions, and never to post to Slack without you approving the exact message.
+
+### A coordinating session
+
+Call `subscribe_inbox` once. Each `via="inbox"` event is a message addressed to you; route it to the session that owns that work, or start one, and tell that session the thread's permalink. A `status` event means messages may be missing until the next `connected`.
+
+### A session working one thread
+
+Call `subscribe_conversation` with the thread's permalink, or `{conversation, thread_ts}`. Every new reply arrives as `via="thread"`, whether or not it mentions you and whether or not you are in the thread. Pass `include_own: true` to see your own replies too (to notice you have already answered). Call `unsubscribe_conversation` when the work is done.
+
+## Consume the log from a Monitor
+
+Without the channel, a session can watch the log in a Monitor (each output line becomes an event in the session):
 
 ```bash
 tail -n 0 -F ~/Library/Logs/slack-inbox/events.jsonl | grep --line-buffered '"kind":"message"'
@@ -168,7 +209,9 @@ The log only grows. Rotate it with `newsyslog` or truncate it from time to time;
 
 ## Limits
 
-- Only conversations you are a member of are seen, as Slack only sends user events for those. A mention in a channel you are not in is not logged.
+- Only conversations you are a member of are seen, as Slack only sends user events for those. A mention in a channel you are not in is not logged, and you can't subscribe to one.
+- A subscription only starts logging once the listener runs a version that reads subscription files (1.1.0 or later): restart it after updating the plugin.
+- A rotated log is read from the start of the new file; lines appended to the old one after a session last read it are not pushed.
 - Messages sent while no connection is open (outside hours, asleep, offline) may never arrive: Slack does not hold events for a disconnected app beyond a few retries. The `disconnected` and `paused` status lines mark those gaps.
 - Edits are ignored, so a mention added by editing a message is not logged.
 - A reply in an old thread you took part in before the listener first ran costs one `conversations.replies` call. Slack limits that method; a lookup that fails is retried on the thread's next reply, and that reply is not logged.

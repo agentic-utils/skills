@@ -7,14 +7,18 @@ import {
   type EventsApiPayload,
   type Me,
   PRIORITY,
+  type SlackMessage,
+  type Trigger,
   needsThreadLookup,
   permalink,
   preview,
   screen,
   threadKey,
   triggers,
+  watched,
 } from './match'
 import { inThread, myGroups, socketUrl, userName, whoami } from './slack'
+import { readWatches, type Watches } from './subs'
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack-inbox]', ...a)
 
@@ -50,6 +54,65 @@ function lock(dir: string): () => void {
     try {
       if (readFileSync(path, 'utf8') === String(process.pid)) unlinkSync(path)
     } catch {}
+  }
+}
+
+export type HandlerDeps = {
+  me: Me
+  teamUrl: string
+  allowBots: Set<string>
+  previewChars: number
+  groups: () => Set<string>
+  userInThread: (channel: string, threadTs: string) => Promise<boolean>
+  remember: (threadKey: string) => void
+  watches: () => Watches
+  userName: (id: string) => Promise<string>
+  emit: (record: Record<string, unknown>) => void
+}
+
+// Turns one Socket Mode event into at most one log record. No socket, no clock: the deps are all it touches.
+export function createHandler(d: HandlerDeps) {
+  const seen = new Set<string>()
+  const firstSighting = (key: string) => {
+    if (seen.has(key)) return false
+    seen.add(key)
+    if (seen.size > 5000) seen.delete(seen.values().next().value!)
+    return true
+  }
+  const record = async (m: SlackMessage, hit: Trigger[], own: boolean) => {
+    const author = m.user ?? m.bot_id ?? 'unknown'
+    d.emit({
+      kind: 'message',
+      trigger: PRIORITY.find(t => hit.includes(t)),
+      triggers: hit,
+      channel: m.channel,
+      channel_type: m.channel_type,
+      ts: m.ts,
+      thread_ts: m.thread_ts ?? null,
+      permalink: permalink(d.teamUrl, m),
+      author: { id: author, name: m.user ? await d.userName(m.user) : author },
+      text: preview(m.text, d.previewChars),
+      ...(own && { from_me: true }),
+    })
+  }
+
+  return async (payload: EventsApiPayload) => {
+    if (payload.event_id && !firstSighting(payload.event_id)) return
+    const s = screen(payload, d.me, d.allowBots)
+    if ('skip' in s) {
+      if (s.skip !== 'own') return
+      if (s.thread) d.remember(s.thread)
+      // the user's own message: logged only where a session subscribed with include_own
+      const m = payload.event!
+      const hit = watched(m, d.watches(), true)
+      if (hit.length && firstSighting(`${m.channel}:${m.ts}`)) await record(m, hit, true)
+      return
+    }
+    const m = s.message
+    if (!firstSighting(`${m.channel}:${m.ts}`)) return
+    const inT = needsThreadLookup(m, d.me) ? await d.userInThread(m.channel, m.thread_ts!) : false
+    const hit = triggers(m, d.me, d.groups(), inT, d.watches())
+    if (hit.length) await record(m, hit, false)
   }
 }
 
@@ -121,40 +184,27 @@ export async function run(cfg: Config) {
     return false
   }
 
-  const seen = new Set<string>()
-  const firstSighting = (key: string) => {
-    if (seen.has(key)) return false
-    seen.add(key)
-    if (seen.size > 5000) seen.delete(seen.values().next().value!)
-    return true
-  }
-
-  const handle = async (payload: EventsApiPayload) => {
-    if (payload.event_id && !firstSighting(payload.event_id)) return
-    const s = screen(payload, me, cfg.allowBots)
-    if ('skip' in s) {
-      if (s.skip === 'own' && s.thread) remember(s.thread)
-      return
-    }
-    const m = s.message
-    if (!firstSighting(`${m.channel}:${m.ts}`)) return
-    const inT = needsThreadLookup(m, me) ? await userInThread(m.channel, m.thread_ts!) : false
-    const hit = triggers(m, me, groups, inT)
-    if (!hit.length) return
-    const author = m.user ?? m.bot_id ?? 'unknown'
-    emit({
-      kind: 'message',
-      trigger: PRIORITY.find(t => hit.includes(t)),
-      triggers: hit,
-      channel: m.channel,
-      channel_type: m.channel_type,
-      ts: m.ts,
-      thread_ts: m.thread_ts ?? null,
-      permalink: permalink(id.url, m),
-      author: { id: author, name: m.user ? await userName(cfg.userToken, m.user) : author },
-      text: preview(m.text, cfg.previewChars),
-    })
-  }
+  let watches: Watches = new Map()
+  let watchesAt = 0
+  const handle = createHandler({
+    me,
+    teamUrl: id.url,
+    allowBots: cfg.allowBots,
+    previewChars: cfg.previewChars,
+    groups: () => groups,
+    userInThread,
+    remember,
+    // sessions change their subscriptions at any time; a couple of seconds' staleness is fine
+    watches: () => {
+      if (Date.now() - watchesAt > 2000) {
+        watches = readWatches(cfg.stateDir)
+        watchesAt = Date.now()
+      }
+      return watches
+    },
+    userName: id => userName(cfg.userToken, id),
+    emit,
+  })
 
   // --- the socket ---
   let ws: WebSocket | null = null

@@ -17,7 +17,7 @@ Then use `/plugin` to browse and install available plugins.
 | [claude-code]  | Skills grounded in Claude Code internals                       |
 | [github]       | Push GitHub PR comments, reviews and CI results into Claude    |
 | [disk-cleanup] | Scan for and clean up disk space on macOS (macOS only)         |
-| [slack-inbox]  | Read-only Slack listener that logs messages addressed to you   |
+| [slack-inbox]  | Slack listener and channel for messages addressed to you       |
 | [ty-lsp]       | Python type checking via [ty](https://github.com/astral-sh/ty) |
 | [svelte-lsp]   | Svelte language server                                         |
 

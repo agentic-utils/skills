@@ -33,7 +33,10 @@ export async function api(method: string, token: string, params: Record<string, 
 
 export const REQUIRED_USER_SCOPES = ['channels:history', 'groups:history', 'im:history', 'mpim:history', 'usergroups:read', 'users:read']
 
-export type Identity = { userId: string; teamId: string; enterpriseId?: string; url: string; missingScopes: string[] }
+// Not needed by the listener; they let subscribe_conversation check membership and Slack Connect up front.
+export const SUBSCRIBE_SCOPES = ['channels:read', 'groups:read', 'im:read', 'mpim:read']
+
+export type Identity = { userId: string; teamId: string; enterpriseId?: string; url: string; missingScopes: string[]; missingSubscribeScopes: string[] }
 
 export async function whoami(userToken: string): Promise<Identity> {
   const { body, scopes } = await api('auth.test', userToken)
@@ -43,6 +46,7 @@ export async function whoami(userToken: string): Promise<Identity> {
     enterpriseId: body.enterprise_id || undefined,
     url: body.url,
     missingScopes: REQUIRED_USER_SCOPES.filter(s => !scopes.includes(s)),
+    missingSubscribeScopes: SUBSCRIBE_SCOPES.filter(s => !scopes.includes(s)),
   }
 }
 
@@ -93,4 +97,28 @@ export async function userName(userToken: string, id: string): Promise<string> {
 // A fresh Socket Mode WebSocket URL. Each URL works once.
 export async function socketUrl(appToken: string): Promise<string> {
   return (await api('apps.connections.open', appToken)).body.url
+}
+
+export type ConversationCheck = { ok: true; name: string; note?: string } | { ok: false; reason: string }
+
+// Whether the listener can see this conversation: the user must be a member (Slack only sends user events for
+// those), and it must not be Slack Connect (the listener drops those). Without a token or the read scope it can't
+// tell, and says so rather than refusing.
+export async function checkConversation(userToken: string | undefined, id: string): Promise<ConversationCheck> {
+  const unverified = (why: string): ConversationCheck => ({ ok: true, name: id, note: `not verified (${why}); events arrive only if you are a member and it is not Slack Connect` })
+  if (!userToken) return unverified('no user token found')
+  let c: Record<string, any>
+  try {
+    c = (await api('conversations.info', userToken, { channel: id })).body.channel ?? {}
+  } catch (e) {
+    const code = e instanceof SlackError ? e.code : (e as Error).message
+    if (code === 'channel_not_found') return { ok: false, reason: `${id} was not found, or you can't see it` }
+    if (code === 'missing_scope') return unverified(`the user token lacks ${id.startsWith('D') ? 'im:read' : 'channels:read, groups:read or mpim:read'}`)
+    return unverified(`conversations.info failed: ${code}`)
+  }
+  const name = c.is_im ? `DM ${id}` : c.name ? `${c.is_mpim ? '' : '#'}${c.name}` : id
+  if (c.is_ext_shared || c.is_pending_ext_shared) return { ok: false, reason: `${name} is a Slack Connect conversation; the listener never logs those` }
+  if (c.is_archived) return { ok: false, reason: `${name} is archived` }
+  if (!c.is_im && !c.is_mpim && c.is_member === false) return { ok: false, reason: `you are not a member of ${name}; join it in Slack first, as the listener only sees conversations you are in` }
+  return { ok: true, name }
 }
