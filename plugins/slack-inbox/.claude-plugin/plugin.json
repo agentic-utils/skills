@@ -1,0 +1,10 @@
+{
+  "name": "agentic-utils-slack-inbox",
+  "version": "1.0.0",
+  "description": "Read-only Slack listener (Socket Mode) that appends one JSONL line per message addressed to you, for a coordinator session to Monitor",
+  "author": {
+    "name": "agentic-utils"
+  },
+  "homepage": "https://github.com/agentic-utils/skills",
+  "keywords": ["slack", "socket-mode", "inbox", "monitor", "jsonl"]
+}

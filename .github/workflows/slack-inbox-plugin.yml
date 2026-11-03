@@ -1,0 +1,26 @@
+name: slack-inbox plugin
+
+on:
+  pull_request:
+    paths: ['plugins/slack-inbox/**', '.github/workflows/slack-inbox-plugin.yml']
+  push:
+    branches: [main]
+    paths: ['plugins/slack-inbox/**', '.github/workflows/slack-inbox-plugin.yml']
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: plugins/slack-inbox
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+      - run: bun test
+      - run: bun build src/cli.ts --target=bun --outfile /tmp/slack-inbox-cli.js

@@ -1,0 +1,9 @@
+{
+  "name": "agentic-utils-slack-inbox",
+  "private": true,
+  "scripts": {
+    "start": "bun src/cli.ts run",
+    "test": "bun test"
+  },
+  "type": "module"
+}
