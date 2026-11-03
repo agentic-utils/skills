@@ -27,6 +27,7 @@ wait $c
 // result, unless FAKE_NO_SLURP makes it an unknown flag, like gh before 2.48. <file>.delay holds the call that many
 // seconds; with FAKE_GH_LOG set, each served call logs "call <path> inm=<If-None-Match>" and "done <path>" there.
 // <file>.etag is its ETag: -i sends it, and a matching If-None-Match gets a 304 (gh exits 1 on it, like the real one).
+// -X DELETE logs "delete <path>" to $FAKE_API/../deleted and succeeds; with FAKE_DELETE_FREES it also removes $FAKE_REFUSE.
 const fakeGh = `#!/bin/bash
 [ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
 for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
@@ -35,6 +36,7 @@ case " $* " in *" -q "*) printf 'main\\ttrue\\t%s\\n' "$FAKE_HEAD"; exit ;; esac
 f="$FAKE_API/$(printf %s "\${path%%\\?*}" | tr / _)"
 page=$(printf '&%s' "\${path#*\\?}" | sed -n 's/.*&page=\\([0-9]*\\).*/\\1/p')
 [ -n "$page" ] && [ -f "$f@$page" ] && f="$f@$page"
+case " $* " in *" -X DELETE "*) echo "delete $path" >> "$FAKE_API/../deleted"; [ -n "$FAKE_DELETE_FREES" ] && rm -f "$FAKE_REFUSE"; exit 0 ;; esac
 [ -f "$f" ] || exit 1
 [ -f "$f.delay" ] && sleep "$(cat "$f.delay")"
 [ -n "$FAKE_GH_LOG" ] && trap 'echo "done $path" >> "$FAKE_GH_LOG"' EXIT
@@ -1374,6 +1376,59 @@ test(
     expect(hellos(s, 970)).toBe(0)
     writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr2"') // the PR changed
     await until('polled comment', () => hellos(s, 970))
+    await s.close()
+  },
+  T,
+)
+
+test(
+  "a forward refused by a dead hook deletes only the dead gh-webhook hooks and goes live",
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', FAKE_DELETE_FREES: '1' })
+    e.env.FAKE_REFUSE = `${e.api}/../refuse`
+    writeFileSync(e.env.FAKE_REFUSE, TAKEN)
+    quietPr(e, 'abcdef12')
+    const at = (msAgo: number) => new Date(Date.now() - msAgo).toISOString()
+    const relay = { url: 'https://webhook-forwarder.github.com/hook' }
+    serve(e, 'repos/o/r/hooks', [
+      { id: 1, name: 'cli', active: true, created_at: at(86_400_000), config: relay }, // 404 a day later: dead
+      { id: 2, name: 'cli', active: true, created_at: at(86_400_000), config: relay }, // 200: someone's live forward
+      { id: 3, name: 'cli', active: true, created_at: at(20_000), config: relay }, // 404 while still starting
+      { id: 4, name: 'cli', active: false, created_at: at(7_200_000), config: relay }, // inactive, no deliveries: dead
+      { id: 5, name: 'cli', active: false, created_at: at(600_000), config: relay }, // inactive but recent
+      { id: 6, name: 'web', active: true, created_at: at(86_400_000), config: { url: 'https://ci.example.com/hook' } },
+    ])
+    serve(e, 'repos/o/r/hooks/1/deliveries', [{ status_code: 404, delivered_at: at(60_000) }])
+    serve(e, 'repos/o/r/hooks/2/deliveries', [{ status_code: 200, delivered_at: at(60_000) }])
+    serve(e, 'repos/o/r/hooks/3/deliveries', [{ status_code: 404, delivered_at: at(15_000) }])
+    for (const id of [4, 5, 6]) serve(e, `repos/o/r/hooks/${id}/deliveries`, [])
+    const d = await daemon(e)
+    const s = stream(d, 'sess-reap')
+    expect((await call(d, 'sess-reap', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
+    await up(e)
+    const deleted = readFileSync(`${e.api}/../deleted`, 'utf8').trim().split('\n').sort()
+    expect(deleted).toEqual(['delete repos/o/r/hooks/1', 'delete repos/o/r/hooks/4'])
+    await Bun.sleep(500)
+    expect(s.got.filter(g => g.meta.event === 'polling')).toEqual([])
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a repo the permissions say we are not admin on is polled without starting gh-webhook',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1' })
+    quietPr(e, 'abcdef13')
+    serve(e, 'repos/o/r', { full_name: 'o/r', permissions: { admin: false, push: true, pull: true } })
+    const d = await daemon(e)
+    const s = stream(d, 'sess-noadmin')
+    expect((await call(d, 'sess-noadmin', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
+    await until('polling notice', () => s.got.length)
+    expect(s.got[0].content).toBe('pr-events: polling o/r#7 every 1s (forward unavailable: no admin on the repo)')
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(980, new Date().toISOString())])
+    await until('polled comment', () => hellos(s, 980))
+    expect(forwarders(e).size).toBe(0) // never even tried
     await s.close()
   },
   T,
