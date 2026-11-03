@@ -51,15 +51,36 @@ function token(env: Env, name: string, file: string | undefined, prefix: string,
 
 export type Flags = { config?: string; hours?: string; days?: string; log?: string }
 
-export function loadConfig(flags: Flags, env: Env = process.env): Config {
+function readFileConfig(flags: Flags, env: Env): FileConfig {
   const path = flags.config ?? env.SLACK_INBOX_CONFIG ?? `${homedir()}/.config/slack-inbox/config.json`
-  let file: FileConfig = {}
   try {
-    file = JSON.parse(readFileSync(expand(path), 'utf8'))
+    return JSON.parse(readFileSync(expand(path), 'utf8'))
   } catch (e) {
     // a missing default file is fine; one named on purpose, or one that doesn't parse, is not
     if ((e as { code?: string }).code !== 'ENOENT' || flags.config || env.SLACK_INBOX_CONFIG) throw new Error(`config ${path}: ${(e as Error).message}`)
+    return {}
   }
+}
+
+const logFileOf = (flags: Flags, env: Env, file: FileConfig) => expand(flags.log ?? env.SLACK_INBOX_LOG ?? file.log_file ?? defaultLogFile())
+const stateDirOf = (env: Env, file: FileConfig) => expand(env.SLACK_INBOX_STATE_DIR ?? file.state_dir ?? `${homedir()}/.local/state/slack-inbox`)
+
+export type Paths = { logFile: string; stateDir: string; userToken?: string }
+
+// What a session's channel server needs: where the listener logs and keeps state, resolved the same way the
+// listener resolves them (so settings that differ must live in the config file, not only in the LaunchAgent's env),
+// and the user token if one can be found, for checking a conversation before subscribing. Never throws on a token.
+export function loadPaths(env: Env = process.env): Paths {
+  const file = readFileConfig({}, env)
+  let userToken: string | undefined
+  try {
+    userToken = token(env, 'SLACK_INBOX_USER_TOKEN', file.user_token_file ?? `${homedir()}/.config/slack-inbox/user-token`, 'xoxp-', 'user token')
+  } catch {}
+  return { logFile: logFileOf({}, env, file), stateDir: stateDirOf(env, file), userToken }
+}
+
+export function loadConfig(flags: Flags, env: Env = process.env): Config {
+  const file = readFileConfig(flags, env)
   const hours = flags.hours ?? env.SLACK_INBOX_HOURS ?? file.hours
   const days = flags.days ?? env.SLACK_INBOX_DAYS ?? file.days
   const allow = env.SLACK_INBOX_ALLOW_BOTS?.split(',') ?? file.allow_bots ?? []
@@ -71,8 +92,8 @@ export function loadConfig(flags: Flags, env: Env = process.env): Config {
   return {
     appToken: token(env, 'SLACK_INBOX_APP_TOKEN', file.app_token_file, 'xapp-', 'app-level token with connections:write'),
     userToken: token(env, 'SLACK_INBOX_USER_TOKEN', file.user_token_file, 'xoxp-', 'user token from the same app'),
-    logFile: expand(flags.log ?? env.SLACK_INBOX_LOG ?? file.log_file ?? defaultLogFile()),
-    stateDir: expand(env.SLACK_INBOX_STATE_DIR ?? file.state_dir ?? `${homedir()}/.local/state/slack-inbox`),
+    logFile: logFileOf(flags, env, file),
+    stateDir: stateDirOf(env, file),
     allowBots: new Set(allow.map(s => s.trim()).filter(Boolean)),
     groupRefreshMinutes: num(env.SLACK_INBOX_GROUP_REFRESH_MINUTES ?? file.group_refresh_minutes, 30, 1),
     previewChars: num(env.SLACK_INBOX_PREVIEW_CHARS ?? file.preview_chars, 200, 20),

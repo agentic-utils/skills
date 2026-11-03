@@ -19,6 +19,8 @@ async function check(flags: Parameters<typeof loadConfig>[0]) {
   const id = await whoami(cfg.userToken)
   console.log(`user token: ok, user ${id.userId} in ${id.url}`)
   if (id.missingScopes.length) console.log(`user token: MISSING scopes ${id.missingScopes.join(', ')}`)
+  if (id.missingSubscribeScopes.length)
+    console.log(`user token: without ${id.missingSubscribeScopes.join(', ')}, subscribe_conversation can't check membership there (optional)`)
   const groups = await myGroups(cfg.userToken, id.userId)
   console.log(`user groups: member of ${groups.size}`)
   await socketUrl(cfg.appToken) // an unused URL just expires

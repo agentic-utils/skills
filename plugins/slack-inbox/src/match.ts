@@ -1,9 +1,10 @@
 // Decides whether one Socket Mode event is something the user should hear about. Pure: no network, no clock.
 
-export type Trigger = 'dm' | 'group_dm' | 'mention' | 'group_mention' | 'thread_reply'
+export type Trigger = 'dm' | 'group_dm' | 'mention' | 'group_mention' | 'thread_reply' | 'watched_thread' | 'watched_conversation'
 
 // Highest first: the record's `trigger` is the first of these that matched.
-export const PRIORITY: Trigger[] = ['dm', 'group_dm', 'mention', 'group_mention', 'thread_reply']
+// The watched_* ones come from a session's subscription, not from the message being addressed to the user.
+export const PRIORITY: Trigger[] = ['dm', 'group_dm', 'mention', 'group_mention', 'thread_reply', 'watched_thread', 'watched_conversation']
 
 export type Me = { userId: string; teamId: string; enterpriseId?: string }
 
@@ -65,8 +66,9 @@ export function screen(payload: EventsApiPayload, me: Me, allowBots: Set<string>
 const SUBTEAM = /<!subteam\^([A-Z0-9]+)/g
 
 // Every trigger the message hits. `inThread` says whether the user started or replied in the message's thread; the
-// caller looks that up only when needsThreadLookup says it matters.
-export function triggers(m: SlackMessage, me: Me, groups: Set<string>, inThread: boolean): Trigger[] {
+// caller looks that up only when needsThreadLookup says it matters. `watches` holds the conversations and threads
+// some session subscribed to (keys as subKey makes them).
+export function triggers(m: SlackMessage, me: Me, groups: Set<string>, inThread: boolean, watches: Map<string, boolean> = new Map()): Trigger[] {
   const out: Trigger[] = []
   if (m.channel_type === 'im') out.push('dm')
   if (m.channel_type === 'mpim') out.push('group_dm')
@@ -78,6 +80,15 @@ export function triggers(m: SlackMessage, me: Me, groups: Set<string>, inThread:
       break
     }
   if (isThreadReply(m) && (m.parent_user_id === me.userId || inThread)) out.push('thread_reply')
+  return [...out, ...watched(m, watches, false)]
+}
+
+// The watched_* triggers alone. `own`: the message is the user's, logged only where a session asked for those.
+export function watched(m: SlackMessage, watches: Map<string, boolean>, own: boolean): Trigger[] {
+  const out: Trigger[] = []
+  const wants = (k: string) => watches.has(k) && (!own || watches.get(k) === true)
+  if (isThreadReply(m) && wants(threadKey(m.channel, m.thread_ts!))) out.push('watched_thread')
+  if (wants(m.channel)) out.push('watched_conversation')
   return out
 }
 
