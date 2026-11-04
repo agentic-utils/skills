@@ -78,6 +78,13 @@ export async function inThread(userToken: string, userId: string, channel: strin
   return false
 }
 
+// When the newest message in a conversation was sent, in milliseconds, or 0 if it has none.
+export async function newestMessageAt(userToken: string, channel: string): Promise<number> {
+  const { body } = await api('conversations.history', userToken, { channel, limit: '1' })
+  const ts = body.messages?.[0]?.ts
+  return ts ? Number(ts) * 1000 : 0
+}
+
 const names = new Map<string, { name: string; at: number }>()
 
 // Display name for the record, cached for a day; falls back to the id if the lookup fails.

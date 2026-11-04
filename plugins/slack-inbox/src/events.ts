@@ -55,7 +55,7 @@ export function route(r: LogRecord, s: SessionFile): Route | null {
 }
 
 // States in which messages may be missed. not_running is the server's own: the listener's process is gone.
-export const OUTAGE = new Set(['disconnected', 'paused', 'stopped', 'not_running'])
+export const OUTAGE = new Set(['disconnected', 'paused', 'stopped', 'not_running', 'stalled'])
 
 // Whether a connection-state change is news to a session that last saw `prev`: each new kind of outage, and the
 // recovery after one. Routine reconnects while already connected, and `started`, are not.
@@ -84,6 +84,7 @@ export function messageNotification(r: LogRecord, route: Route): Notification {
 const STATE_TEXT: Record<string, string> = {
   disconnected: 'the Slack listener disconnected; messages sent until it reconnects may never arrive',
   paused: 'the Slack listener paused outside working hours; messages sent until it resumes may never arrive',
+  stalled: 'the Slack listener is connected but Slack has stopped sending it events; nothing will arrive until they are turned back on, and the user may need to re-enable them in Slack app management',
   stopped: 'the Slack listener stopped; nothing will arrive until it is started again',
   not_running: 'the Slack listener is not running; nothing will arrive until it is started again',
   connected: 'the Slack listener is connected again; messages sent during the gap may be missing',
