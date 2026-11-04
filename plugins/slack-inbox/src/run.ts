@@ -321,7 +321,7 @@ export async function run(cfg: Config) {
     try {
       const r = await puller.pull()
       if (r.lost) {
-        status('lost', `up to ${r.lost} older event${r.lost === 1 ? '' : 's'} dropped by the relay to stay within its size limit before being collected`)
+        status('lost', `up to ${r.lost} older event${r.lost === 1 ? '' : 's'} deleted by the relay before being collected, as too old or to stay within its size limit`)
         status('connected', `pulling from ${cfg.relayUrl}`)
       }
       if (r.skipped) {

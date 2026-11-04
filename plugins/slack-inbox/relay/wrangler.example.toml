@@ -4,7 +4,7 @@ main = "worker.ts"
 compatibility_date = "2026-10-01"
 
 [triggers]
-crons = ["17 3 * * *"] # deletes the oldest rows if the queue is over its size limit
+crons = ["17 3 * * *"] # deletes events nobody collected, and the oldest rows if the queue is over its size limit
 
 [[d1_databases]]
 binding = "DB"
