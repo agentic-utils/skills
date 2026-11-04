@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test'
+import { unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import type { EventsApiPayload, Me, SlackMessage } from './match'
-import { createHandler, sleptFor, socketProblem } from './run'
+import { createHandler, deliveryStalled, recentChannels, sleptFor, socketProblem } from './run'
 import type { Watches } from './subs'
 
 const me: Me = { userId: 'UME', teamId: 'T1' }
@@ -139,4 +141,33 @@ test('a connected socket is replaced only after a minute with no frame at all', 
 test('sleep length reads in seconds, then minutes', () => {
   expect(sleptFor(45_000)).toBe('45s')
   expect(sleptFor(6_000_000)).toBe('100m')
+})
+
+const MIN = 60_000
+
+test('a message sent while connected with no event since it counts as a stall once the grace is over', () => {
+  const s = { connectedAt: 0, lastEventAt: 5 * MIN, newestAt: 10 * MIN }
+  expect(deliveryStalled({ ...s, now: 11 * MIN })).toBe(false)
+  expect(deliveryStalled({ ...s, now: 13 * MIN })).toBe(true)
+})
+
+test('an event after the newest message is not a stall, however long ago', () => {
+  expect(deliveryStalled({ now: 100 * MIN, connectedAt: 0, lastEventAt: 11 * MIN, newestAt: 10 * MIN })).toBe(false)
+})
+
+test('a message from before this connection was missed while down, which is not a stall', () => {
+  expect(deliveryStalled({ now: 100 * MIN, connectedAt: 50 * MIN, lastEventAt: 0, newestAt: 40 * MIN })).toBe(false)
+})
+
+test('nothing readable from Slack is not a stall', () => {
+  expect(deliveryStalled({ now: 100 * MIN, connectedAt: 0, lastEventAt: 0, newestAt: 0 })).toBe(false)
+})
+
+test('recent channels come newest first from the log, skipping lines that have none', () => {
+  const path = `${tmpdir()}/slack-inbox-recent-${process.pid}.jsonl`
+  writeFileSync(path, ['{"kind":"status"}', '{"channel":"C1"}', 'not json', '{"channel":"C2"}', '{"channel":"C1"}', ''].join('\n'))
+  expect(recentChannels(path, 5)).toEqual(['C1', 'C2'])
+  expect(recentChannels(path, 1)).toEqual(['C1'])
+  unlinkSync(path)
+  expect(recentChannels(path, 5)).toEqual([])
 })

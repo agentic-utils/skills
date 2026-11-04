@@ -19,7 +19,7 @@ import {
   viaClaude,
   watched,
 } from './match'
-import { inThread, myGroups, socketUrl, userName, whoami } from './slack'
+import { inThread, myGroups, newestMessageAt, socketUrl, userName, whoami } from './slack'
 import { readWatches, type Watches, wantsOwnInbox } from './subs'
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack-inbox]', ...a)
@@ -30,11 +30,21 @@ const TICK_MS = 15_000
 const SLEPT_MS = 30_000 // a tick this late means the machine slept, so the socket is probably dead
 const HELLO_TIMEOUT_MS = 30_000 // a socket that opens but never says hello would otherwise block reconnecting for good
 const SILENT_MS = 60_000 // Slack pings about every 10 seconds, so this much silence means the socket is dead
+const STALL_GRACE_MS = 2 * 60_000 // how late an event may be before its absence counts
+const STALL_CHECK_MS = 5 * 60_000
+const STALL_CHANNELS = 5 // conversations sampled per check; any recent message in one is enough to tell
 
 // Why a socket should be replaced, or null. Silence includes protocol pings, so a quiet workspace never trips it.
 export function socketProblem(s: { now: number; openedAt: number; helloAt?: number; lastFrameAt?: number }): string | null {
   if (s.helloAt === undefined) return s.now - s.openedAt > HELLO_TIMEOUT_MS ? 'no hello from slack' : null
   return s.now - (s.lastFrameAt ?? s.helloAt) > SILENT_MS ? 'no traffic from slack' : null
+}
+
+// Slack can stop sending events while the socket stays healthy, so only Slack's history can show the silence is wrong.
+// `newestAt` is the newest message in conversations the user is in. A message older than the grace period, with no
+// event since it was sent, should have arrived; one from before this connection was simply missed while it was down.
+export function deliveryStalled(s: { now: number; newestAt: number; lastEventAt: number; connectedAt: number }): boolean {
+  return s.newestAt > s.connectedAt && s.newestAt > s.lastEventAt && s.now - s.newestAt > STALL_GRACE_MS
 }
 
 // Whole minutes once it is worth saying, as the machine may have slept for days.
@@ -68,6 +78,25 @@ function lock(dir: string): () => void {
       if (readFileSync(path, 'utf8') === String(process.pid)) unlinkSync(path)
     } catch {}
   }
+}
+
+// Conversations in the log's newest lines, so a restarted listener can check delivery before its first event.
+export function recentChannels(path: string, max: number): string[] {
+  let lines: string[]
+  try {
+    lines = readFileSync(path, 'utf8').split('\n').slice(-500)
+  } catch {
+    return []
+  }
+  const out = new Set<string>()
+  for (const line of lines.reverse()) {
+    try {
+      const c = JSON.parse(line).channel
+      if (typeof c === 'string') out.add(c)
+    } catch {}
+    if (out.size >= max) break
+  }
+  return [...out]
 }
 
 export type HandlerDeps = {
@@ -229,6 +258,34 @@ export async function run(cfg: Config) {
     emit,
   })
 
+  // --- is Slack still sending events? ---
+  const active = new Map<string, number>() // conversation -> when it last had an event, newest last
+  const noteActive = (channel: string) => {
+    active.delete(channel)
+    active.set(channel, Date.now())
+    if (active.size > STALL_CHANNELS) active.delete(active.keys().next().value!)
+  }
+  for (const c of recentChannels(cfg.logFile, STALL_CHANNELS)) noteActive(c)
+  let lastEventAt = 0
+  let stalled = false
+  let stallCheckAt = 0
+  const checkDelivery = async (now: number) => {
+    if (stalled || health.helloAt === undefined || now - stallCheckAt < STALL_CHECK_MS) return
+    stallCheckAt = now
+    let newestAt = 0
+    for (const channel of active.keys()) {
+      try {
+        newestAt = Math.max(newestAt, await newestMessageAt(cfg.userToken, channel))
+      } catch (e) {
+        log(`delivery check ${channel} failed: ${(e as Error).message}`) // says nothing about delivery, so not a stall
+      }
+    }
+    if (ws && deliveryStalled({ now, newestAt, lastEventAt, connectedAt: health.helloAt })) {
+      stalled = true
+      status('stalled', "slack has newer messages than the last event received; check the app's Enable events setting in Slack app management")
+    }
+  }
+
   // --- the socket ---
   let ws: WebSocket | null = null
   let health = { openedAt: 0, helloAt: undefined as number | undefined, lastFrameAt: undefined as number | undefined }
@@ -291,6 +348,12 @@ export async function run(cfg: Config) {
             later(0)
           }
         } else if (msg.type === 'events_api' && msg.payload) {
+          lastEventAt = Date.now()
+          if (msg.payload.event?.channel) noteActive(msg.payload.event.channel)
+          if (stalled) {
+            stalled = false
+            status('connected', 'events are arriving again')
+          }
           handle(msg.payload).catch(e => log(`event failed: ${(e as Error).message}`))
         }
       }
@@ -341,6 +404,7 @@ export async function run(cfg: Config) {
     // connect first: right after a wake this refresh can wait out a 30 second timeout
     if (!ws && !connecting && now >= retryAt) await connect()
     if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
+    await checkDelivery(now)
     saveThreads()
   }
 
