@@ -27,6 +27,7 @@ wait $c
 // result, unless FAKE_NO_SLURP makes it an unknown flag, like gh before 2.48. <file>.delay holds the call that many
 // seconds; with FAKE_GH_LOG set, each served call logs "call <path> inm=<If-None-Match>" and "done <path>" there.
 // <file>.etag is its ETag: -i sends it, and a matching If-None-Match gets a 304 (gh exits 1 on it, like the real one).
+// <file>.limit is "<calls left> <reset, epoch seconds>": -i sends them as the rate limit headers.
 const fakeGh = `#!/bin/bash
 [ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
 for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
@@ -40,10 +41,11 @@ page=$(printf '&%s' "\${path#*\\?}" | sed -n 's/.*&page=\\([0-9]*\\).*/\\1/p')
 [ -n "$FAKE_GH_LOG" ] && trap 'echo "done $path" >> "$FAKE_GH_LOG"' EXIT
 inm=; for a in "$@"; do case "$a" in "If-None-Match: "*) inm="\${a#If-None-Match: }" ;; esac; done
 [ -n "$FAKE_GH_LOG" ] && echo "call $path inm=$inm" >> "$FAKE_GH_LOG"
-if [ -n "$inm" ] && [ -f "$f.etag" ] && [ "$inm" = "$(cat "$f.etag")" ]; then printf 'HTTP/2.0 304 Not Modified\\r\\nEtag: %s\\r\\n\\r\\n' "$inm"; echo 'gh: HTTP 304' >&2; exit 1; fi
+lim=; [ -f "$f.limit" ] && read -r left reset < "$f.limit" && lim="X-Ratelimit-Remaining: $left\\r\\nX-Ratelimit-Reset: $reset\\r\\n"
+if [ -n "$inm" ] && [ -f "$f.etag" ] && [ "$inm" = "$(cat "$f.etag")" ]; then printf "HTTP/2.0 304 Not Modified\\r\\n$lim"; printf 'Etag: %s\\r\\n\\r\\n' "$inm"; echo 'gh: HTTP 304' >&2; exit 1; fi
 case " $* " in
   *" --slurp "*) [ -n "$FAKE_NO_SLURP" ] && { echo 'unknown flag: --slurp' >&2; exit 1; }; printf '['; cat "$f"; printf ']' ;;
-  *" -i "*) printf 'HTTP/2.0 200 OK\\r\\n'; [ -f "$f.etag" ] && printf 'Etag: %s\\r\\n' "$(cat "$f.etag")"; [ -f "$f@last" ] && printf 'Link: <https://api.github.com/x?per_page=100&page=%s>; rel="last"\\r\\n' "$(cat "$f@last")"; printf '\\r\\n'; cat "$f" ;;
+  *" -i "*) printf "HTTP/2.0 200 OK\\r\\n$lim"; [ -f "$f.etag" ] && printf 'Etag: %s\\r\\n' "$(cat "$f.etag")"; [ -f "$f@last" ] && printf 'Link: <https://api.github.com/x?per_page=100&page=%s>; rel="last"\\r\\n' "$(cat "$f@last")"; printf '\\r\\n'; cat "$f" ;;
   *) cat "$f" ;;
 esac
 `
@@ -1374,6 +1376,30 @@ test(
     expect(hellos(s, 970)).toBe(0)
     writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr2"') // the PR changed
     await until('polled comment', () => hellos(s, 970))
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'polling pauses until the allowance resets when few calls are left, tells the session once and resumes',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr1"')
+    const { s } = await polling(e, NO_ADMIN, 'sess-limit', 'abcdef14')
+    const probes = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '').match(/call repos\/o\/r\/pulls\/7 inm="pr1"/g)?.length ?? 0
+    await until('a conditional probe', probes)
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.limit`, `100 ${Math.ceil(Date.now() / 1000) + 5}\n`)
+    const paused = () => s.got.filter(g => g.content.includes('paused until'))
+    await until('pause notice', () => paused().length)
+    rmSync(`${e.api}/repos_o_r_pulls_7.limit`)
+    await Bun.sleep(1500) // anything in flight lands
+    const held = probes()
+    await Bun.sleep(1500)
+    expect(probes()).toBe(held)
+    await until('polling resumes', () => probes() > held)
+    expect(paused().length).toBe(1)
     await s.close()
   },
   T,
