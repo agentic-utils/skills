@@ -1,7 +1,7 @@
 // Relay mode, on the user's machine: the key pair, opening what the relay sealed, and pulling its queue.
 import { createDecipheriv, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, sign } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
-import { pullMessage, SEAL_INFO } from '../relay/handler'
+import { closeSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs'
+import { ackMessage, pullMessage, SEAL_INFO } from '../relay/handler'
 import type { EventsApiPayload } from './match'
 
 export type RelayKeys = { seal: { d: string; x: string }; sign: { d: string; x: string } }
@@ -39,7 +39,11 @@ export function signPull(k: RelayKeys, time: string, after: string): string {
   return sign(null, Buffer.from(pullMessage(time, after)), jwkOf('Ed25519', k.sign)).toString('base64')
 }
 
-export type Fetch = (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<any> }>
+export function signAck(k: RelayKeys, time: string, through: string): string {
+  return sign(null, Buffer.from(ackMessage(time, through)), jwkOf('Ed25519', k.sign)).toString('base64')
+}
+
+export type Fetch = (url: string, init: { method?: string; headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<any> }>
 
 export type PullerDeps = {
   url: string
@@ -53,6 +57,17 @@ export type PullerDeps = {
 
 const FAILURES_BEFORE_OUTAGE = 3
 
+// Replaced whole, as a crash during an ordinary write could leave it empty, which reads as "start from the beginning".
+function saveCursor(path: string, value: number) {
+  const fd = openSync(`${path}.tmp`, 'w', 0o600)
+  try {
+    writeSync(fd, String(value))
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(`${path}.tmp`, path)
+}
+
 const readCursor = (path: string) => {
   try {
     const n = Number(readFileSync(path, 'utf8'))
@@ -63,16 +78,50 @@ const readCursor = (path: string) => {
 }
 
 // `lost`: how many events the relay dropped before they were pulled, seen as a jump in its ids.
-export type PullResult = { handled: number; failures: number; lost: number; error?: string }
+// `skipped`: how many it held that could never be opened or handled.
+export type PullResult = { handled: number; failures: number; lost: number; skipped: number; error?: string }
+
+// A failure that says nothing about the event (a full disk, Slack unavailable), so the event must wait rather than go.
+const retryable = (err: unknown) => {
+  const e = err as { retry?: boolean; code?: unknown }
+  return e.retry === true || (typeof e.code === 'string' && /^E[A-Z]+$/.test(e.code))
+}
 
 // Reads the queue from a cursor kept on disk, so a restart resumes where it stopped. Delivery is at least once: a
-// crash between handling an event and saving the cursor repeats that one event. An event it can't open is logged
-// and skipped, or one bad row would block the queue for good.
+// crash between handling an event and saving the cursor repeats that one event. An event that can never be opened or
+// handled is skipped and counted, or one bad row would block the queue for good. A retryable failure stops the pull
+// with the cursor where it is, so that event is tried again next time. Once a pull finishes, the relay is told to
+// delete what was collected. Nothing from the first skipped event on is deleted until the listener restarts, in case a
+// corrected key can still open it; they expire anyway.
 export function createPuller(d: PullerDeps) {
   const doFetch = d.fetch ?? (fetch as unknown as Fetch)
   const now = d.now ?? Date.now
   let after = readCursor(d.cursorFile)
   let failures = 0
+  let acked = 0
+  let keepFrom = Number.POSITIVE_INFINITY // the first event skipped since starting: nothing from here on is deleted
+  let ackWarned = false
+
+  // Never fails a pull: an event that isn't deleted now is deleted by the next ack, or when it expires.
+  const ack = async () => {
+    const through = Math.min(after, keepFrom - 1)
+    if (through <= acked) return
+    try {
+      const time = String(Math.floor(now() / 1000))
+      const q = String(through)
+      const res = await doFetch(`${d.url.replace(/\/$/, '')}/ack?through=${q}`, {
+        method: 'POST',
+        headers: { 'x-relay-time': time, 'x-relay-signature': signAck(d.keys, time, q) },
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (!res.ok) throw new Error(`relay answered ${res.status}`)
+      acked = through
+      ackWarned = false
+    } catch (err) {
+      if (!ackWarned) d.log(`relay kept collected events, will try again: ${(err as Error).message}`)
+      ackWarned = true
+    }
+  }
 
   return {
     outage: () => failures >= FAILURES_BEFORE_OUTAGE,
@@ -89,6 +138,7 @@ export function createPuller(d: PullerDeps) {
     async pull(): Promise<PullResult> {
       let handled = 0
       let lost = 0
+      let skipped = 0
       try {
         for (;;) {
           const time = String(Math.floor(now() / 1000))
@@ -100,23 +150,27 @@ export function createPuller(d: PullerDeps) {
           if (!res.ok) throw new Error(`relay answered ${res.status}`)
           const { events } = (await res.json()) as { events: { id: number; sealed: string }[] }
           for (const e of events) {
-            if (e.id > after + 1) lost += e.id - after - 1
             try {
               await d.handle(JSON.parse(openSealed(d.keys, e.sealed)))
             } catch (err) {
+              if (retryable(err)) throw err
               d.log(`relay event ${e.id} skipped: ${(err as Error).message}`)
+              skipped++
+              keepFrom = Math.min(keepFrom, e.id)
             }
+            if (e.id > after + 1) lost += e.id - after - 1
             after = e.id
-            writeFileSync(d.cursorFile, String(after), { mode: 0o600 })
+            saveCursor(d.cursorFile, after)
             handled++
           }
           if (events.length === 0) break
         }
         failures = 0
-        return { handled, failures, lost }
+        await ack()
+        return { handled, failures, lost, skipped }
       } catch (err) {
         failures++
-        return { handled, failures, lost, error: (err as Error).message }
+        return { handled, failures, lost, skipped, error: (err as Error).message }
       }
     },
   }

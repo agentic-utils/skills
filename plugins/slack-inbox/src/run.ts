@@ -20,7 +20,7 @@ import {
   watched,
 } from './match'
 import { createPuller, type RelayKeys } from './pull'
-import { inThread, myGroups, newestMessageAt, socketUrl, userName, whoami } from './slack'
+import { inThread, myGroups, newestMessageAt, SlackError, socketUrl, userName, whoami } from './slack'
 import { readWatches, type Watches, wantsOwnInbox } from './subs'
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack-inbox]', ...a)
@@ -101,6 +101,16 @@ export function recentChannels(path: string, max: number): string[] {
   return [...out]
 }
 
+// A queued mention of a user group can only be matched once the user's groups are known, and a message matched
+// without them is consumed for good. So nothing is pulled until they have loaded; the queue keeps it meanwhile.
+export async function drainRelay(d: { groupsLoaded: () => boolean; loadGroups: () => Promise<void>; pull: () => Promise<void> }) {
+  if (!d.groupsLoaded()) await d.loadGroups()
+  if (d.groupsLoaded()) await d.pull()
+}
+// Whether asking Slack again later could give a different answer, unlike thread_not_found and the like.
+export const slackMayRecover = (e: unknown) =>
+  !(e instanceof SlackError) || /^(ratelimited|internal_error|fatal_error|service_unavailable|request_timeout|http_5\d\d)$/.test(e.code)
+
 export type HandlerDeps = {
   me: Me
   teamUrl: string
@@ -122,9 +132,11 @@ const keep = (hit: Trigger[], external: boolean) => (external ? hit.filter(t => 
 // Turns one Socket Mode event into at most one log record. No socket, no clock: the deps are all it touches.
 export function createHandler(d: HandlerDeps) {
   const seen = new Set<string>()
-  const firstSighting = (key: string) => {
+  // `marked` collects what this event newly marked as seen, so a failed event can be tried again rather than ignored.
+  const firstSighting = (key: string, marked: string[]) => {
     if (seen.has(key)) return false
     seen.add(key)
+    marked.push(key)
     if (seen.size > 5000) seen.delete(seen.values().next().value!)
     return true
   }
@@ -148,22 +160,28 @@ export function createHandler(d: HandlerDeps) {
   }
 
   return async (payload: EventsApiPayload) => {
-    if (payload.event_id && !firstSighting(payload.event_id)) return
-    const s = screen(payload, d.me, d.allowBots)
-    if ('skip' in s) {
-      if (s.skip !== 'own') return
-      if (s.thread) d.remember(s.thread)
-      // the user's own message: logged when the listener wants all of them, or where a session subscribed with include_own
-      const m = payload.event!
-      const hit = keep([...(d.logOwn() ? (['own'] as const) : []), ...watched(m, d.watches(), true)], s.external)
-      if (hit.length && firstSighting(`${m.channel}:${m.ts}`)) await record(m, hit, true, s.external)
-      return
+    const marked: string[] = []
+    try {
+      if (payload.event_id && !firstSighting(payload.event_id, marked)) return
+      const s = screen(payload, d.me, d.allowBots)
+      if ('skip' in s) {
+        if (s.skip !== 'own') return
+        if (s.thread) d.remember(s.thread)
+        // the user's own message: logged when the listener wants all of them, or where a session subscribed with include_own
+        const m = payload.event!
+        const hit = keep([...(d.logOwn() ? (['own'] as const) : []), ...watched(m, d.watches(), true)], s.external)
+        if (hit.length && firstSighting(`${m.channel}:${m.ts}`, marked)) await record(m, hit, true, s.external)
+        return
+      }
+      const m = s.message
+      if (!firstSighting(`${m.channel}:${m.ts}`, marked)) return
+      const inT = needsThreadLookup(m, d.me) ? await d.userInThread(m.channel, m.thread_ts!) : false
+      const hit = keep(triggers(m, d.me, d.groups(), inT, d.watches()), s.external)
+      if (hit.length) await record(m, hit, false, s.external)
+    } catch (e) {
+      for (const key of marked) seen.delete(key)
+      throw e
     }
-    const m = s.message
-    if (!firstSighting(`${m.channel}:${m.ts}`)) return
-    const inT = needsThreadLookup(m, d.me) ? await d.userInThread(m.channel, m.thread_ts!) : false
-    const hit = keep(triggers(m, d.me, d.groups(), inT, d.watches()), s.external)
-    if (hit.length) await record(m, hit, false, s.external)
   }
 }
 
@@ -206,14 +224,21 @@ export async function run(cfg: Config) {
 
   let groups = new Set<string>()
   let groupsAt = 0
+  let groupsLoaded = false
+  let groupsWaitReported = false
   const refreshGroups = async () => {
     try {
       groups = await myGroups(cfg.userToken, me.userId)
       groupsAt = Date.now()
+      groupsLoaded = true
       log(`in ${groups.size} user group(s)`)
     } catch (e) {
       log(`user group refresh failed, keeping the last list: ${(e as Error).message}`)
       groupsAt = Date.now() - cfg.groupRefreshMinutes * 60_000 + 60_000 // try again in a minute
+      if (cfg.relayUrl && !groupsLoaded && !groupsWaitReported) {
+        groupsWaitReported = true
+        status('disconnected', `not pulling from the relay until user groups load: ${(e as Error).message}`)
+      }
     }
   }
 
@@ -229,6 +254,8 @@ export async function run(cfg: Config) {
       }
     } catch (e) {
       log(`thread lookup ${key} failed: ${(e as Error).message}`)
+      // The relay still holds this message, so it can wait for Slack; a socket has only this one chance to log it.
+      if (cfg.relayUrl && slackMayRecover(e)) throw Object.assign(e as Error, { retry: true })
       return false // not cached, so the next reply asks again
     }
     notIn.set(key, Date.now())
@@ -294,14 +321,18 @@ export async function run(cfg: Config) {
     try {
       const r = await puller.pull()
       if (r.lost) {
-        status('lost', `up to ${r.lost} older event${r.lost === 1 ? '' : 's'} dropped by the relay to stay within its size limit before being collected`)
+        status('lost', `up to ${r.lost} older event${r.lost === 1 ? '' : 's'} deleted by the relay before being collected, as too old or to stay within its size limit`)
+        status('connected', `pulling from ${cfg.relayUrl}`)
+      }
+      if (r.skipped) {
+        status('lost', `${r.skipped} event${r.skipped === 1 ? '' : 's'} from the relay could not be opened or handled and ${r.skipped === 1 ? 'was' : 'were'} skipped; the listener's log says why`)
         status('connected', `pulling from ${cfg.relayUrl}`)
       }
       if (r.error) {
         if (r.failures === 1) log(`relay pull failed: ${r.error}`)
         if (puller.outage() && !relayDown) {
           relayDown = true
-          status('disconnected', `relay unreachable: ${r.error}`)
+          status('disconnected', `not collecting from the relay, which keeps the events meanwhile: ${r.error}`)
         }
         return
       }
@@ -443,7 +474,7 @@ export async function run(cfg: Config) {
     }
     paused = false
     // connect first: right after a wake this refresh can wait out a 30 second timeout
-    if (puller) await pullRelay()
+    if (puller) await drainRelay({ groupsLoaded: () => groupsLoaded, loadGroups: refreshGroups, pull: pullRelay })
     else if (!ws && !connecting && now >= retryAt) await connect()
     if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
     await checkDelivery(now)

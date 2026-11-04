@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test'
 import { unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import type { EventsApiPayload, Me, SlackMessage } from './match'
-import { createHandler, deliveryStalled, recentChannels, sleptFor, socketProblem } from './run'
+import { createHandler, deliveryStalled, drainRelay, recentChannels, slackMayRecover, sleptFor, socketProblem } from './run'
+import { SlackError } from './slack'
 import type { Watches } from './subs'
 
 const me: Me = { userId: 'UME', teamId: 'T1' }
@@ -177,4 +178,54 @@ test("someone else writing the attribution line does not get the via_claude flag
   await s.handle(event({ channel: 'D1', channel_type: 'im', text: 'skip this one _✨ via <https://example.invalid|Claude session>_' }))
   expect(s.out).toHaveLength(1)
   expect(s.out[0].via_claude).toBeUndefined()
+})
+
+test('the relay is not pulled until the user groups have loaded', async () => {
+  const calls: string[] = []
+  let loaded = false
+  const d = { groupsLoaded: () => loaded, loadGroups: async () => void calls.push('load'), pull: async () => void calls.push('pull') }
+  await drainRelay(d)
+  expect(calls).toEqual(['load'])
+  d.loadGroups = async () => {
+    calls.push('load')
+    loaded = true
+  }
+  await drainRelay(d)
+  expect(calls).toEqual(['load', 'load', 'pull'])
+  await drainRelay(d)
+  expect(calls).toEqual(['load', 'load', 'pull', 'pull'])
+})
+
+test('an event that failed part way is handled in full when it comes round again', async () => {
+  const out: Record<string, any>[] = []
+  let fail = true
+  const handle = createHandler({
+    me,
+    teamUrl: 'https://example.slack.com/',
+    allowBots: new Set(),
+    previewChars: 200,
+    groups: () => new Set(),
+    userInThread: async () => false,
+    remember: () => {},
+    watches: () => new Map(),
+    logOwn: () => false,
+    userName: async id => id,
+    emit: r => {
+      if (fail) throw new Error('no space left')
+      out.push(r)
+    },
+  })
+  const dm = event({ channel: 'D1', channel_type: 'im' }, { event_id: 'Ev1' })
+  await expect(handle(dm)).rejects.toThrow('no space left')
+  fail = false
+  await handle(dm)
+  await handle(dm)
+  expect(out).toHaveLength(1)
+})
+
+test('only a failure Slack could recover from is worth waiting for', () => {
+  expect(slackMayRecover(new TypeError('network down'))).toBe(true)
+  expect(slackMayRecover(new SlackError('conversations.replies', 'ratelimited'))).toBe(true)
+  expect(slackMayRecover(new SlackError('conversations.replies', 'http_503'))).toBe(true)
+  expect(slackMayRecover(new SlackError('conversations.replies', 'thread_not_found'))).toBe(false)
 })

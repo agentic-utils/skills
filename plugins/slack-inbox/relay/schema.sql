@@ -1,5 +1,5 @@
 -- AUTOINCREMENT never reuses an id, so a pull cursor can't skip or repeat a row after a delete.
--- expires_at is unused, always 0: events now stay until space is needed, and removing it would mean rebuilding the table.
+-- expires_at is when an event nobody collected gets deleted, in milliseconds. Collected events go sooner.
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id TEXT NOT NULL UNIQUE,
@@ -7,3 +7,5 @@ CREATE TABLE IF NOT EXISTS events (
   expires_at INTEGER NOT NULL
 );
 DROP INDEX IF EXISTS events_expires_at;
+-- Rows stored while events had no time limit. Safe to repeat: new rows are never 0.
+UPDATE events SET expires_at = (unixepoch() + 14 * 86400) * 1000 WHERE expires_at = 0;
