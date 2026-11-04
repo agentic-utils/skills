@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { createCipheriv, createHmac, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, verify as edVerify } from 'node:crypto'
 import { createRelay, MAX_QUEUE_BYTES, type Queued, ROW_OVERHEAD_BYTES, rowsToEvict, SEAL_INFO, type Store, trim } from '../relay/handler'
@@ -231,4 +231,18 @@ test('a damaged cursor file starts again from the beginning rather than failing'
   await relay(post(callback()))
   await createPuller({ url: 'https://r.example', keys, cursorFile: f, now: () => NOW, log: () => {}, fetch: viaRelay(relay), handle: async (x: any) => void seen.push(x.event_id) }).pull()
   expect(seen).toEqual(['Ev1'])
+})
+
+test('the cursor file is replaced whole, private to the user, and leaves nothing behind', async () => {
+  const f = tmp()
+  writeFileSync(f, '0', { mode: 0o600 })
+  const before = statSync(f).ino
+  const { store } = memStore()
+  const relay = setup(store)
+  await relay(post(callback()))
+  await createPuller({ url: 'https://r.example', keys, cursorFile: f, now: () => NOW, log: () => {}, fetch: viaRelay(relay), handle: async () => {} }).pull()
+  expect(readFileSync(f, 'utf8')).toBe('1')
+  expect(statSync(f).ino).not.toBe(before)
+  expect(statSync(f).mode & 0o077).toBe(0)
+  expect(existsSync(`${f}.tmp`)).toBe(false)
 })

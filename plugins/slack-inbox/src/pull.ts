@@ -1,6 +1,6 @@
 // Relay mode, on the user's machine: the key pair, opening what the relay sealed, and pulling its queue.
 import { createDecipheriv, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, sign } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs'
 import { pullMessage, SEAL_INFO } from '../relay/handler'
 import type { EventsApiPayload } from './match'
 
@@ -52,6 +52,17 @@ export type PullerDeps = {
 }
 
 const FAILURES_BEFORE_OUTAGE = 3
+
+// Replaced whole, as a crash during an ordinary write could leave it empty, which reads as "start from the beginning".
+function saveCursor(path: string, value: number) {
+  const fd = openSync(`${path}.tmp`, 'w', 0o600)
+  try {
+    writeSync(fd, String(value))
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(`${path}.tmp`, path)
+}
 
 const readCursor = (path: string) => {
   try {
@@ -107,7 +118,7 @@ export function createPuller(d: PullerDeps) {
               d.log(`relay event ${e.id} skipped: ${(err as Error).message}`)
             }
             after = e.id
-            writeFileSync(d.cursorFile, String(after), { mode: 0o600 })
+            saveCursor(d.cursorFile, after)
             handled++
           }
           if (events.length === 0) break
