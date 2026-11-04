@@ -4,7 +4,7 @@ import { homedir, platform } from 'node:os'
 import { type Hours, parseHours } from './hours'
 
 export type Config = {
-  appToken: string
+  appToken: string // empty in relay mode, which holds no socket
   userToken: string
   logFile: string
   stateDir: string
@@ -13,6 +13,8 @@ export type Config = {
   previewChars: number
   includeOwn: boolean
   hours?: Hours
+  relayUrl?: string
+  relayKeyFile: string
 }
 
 type FileConfig = {
@@ -26,11 +28,15 @@ type FileConfig = {
   include_own?: boolean
   hours?: string
   days?: string
+  relay_url?: string
+  relay_key_file?: string
 }
 
 type Env = Record<string, string | undefined>
 
 const expand = (p: string) => p.replace(/^~(?=\/|$)/, homedir())
+
+export const defaultRelayKeyFile = () => `${homedir()}/.config/slack-inbox/relay-key`
 
 export const defaultLogFile = () =>
   platform() === 'darwin' ? `${homedir()}/Library/Logs/slack-inbox/events.jsonl` : `${homedir()}/.local/state/slack-inbox/events.jsonl`
@@ -99,8 +105,11 @@ export function loadConfig(flags: Flags, env: Env = process.env): Config {
     if (!Number.isFinite(n) || n < min) throw new Error(`bad number ${v}`)
     return n
   }
+  const relayUrl = env.SLACK_INBOX_RELAY_URL ?? file.relay_url
+  // plain http only to this machine, for trying the relay locally: sealed events are safe, but pull signatures are replayable
+  if (relayUrl && !/^(https:\/\/|http:\/\/(127\.0\.0\.1|localhost)[:/])/.test(relayUrl)) throw new Error(`relay URL must be https: ${relayUrl}`)
   return {
-    appToken: token(env, 'SLACK_INBOX_APP_TOKEN', file.app_token_file, 'xapp-', 'app-level token with connections:write'),
+    appToken: relayUrl ? '' : token(env, 'SLACK_INBOX_APP_TOKEN', file.app_token_file, 'xapp-', 'app-level token with connections:write'),
     userToken: token(env, 'SLACK_INBOX_USER_TOKEN', file.user_token_file, 'xoxp-', 'user token from the same app'),
     logFile: logFileOf(flags, env, file),
     stateDir: stateDirOf(env, file),
@@ -109,5 +118,7 @@ export function loadConfig(flags: Flags, env: Env = process.env): Config {
     previewChars: num(env.SLACK_INBOX_PREVIEW_CHARS ?? file.preview_chars, 200, 20),
     includeOwn: flag(env.SLACK_INBOX_INCLUDE_OWN, file.include_own),
     hours: hours ? parseHours(hours, days) : undefined,
+    relayUrl,
+    relayKeyFile: expand(env.SLACK_INBOX_RELAY_KEY_FILE ?? file.relay_key_file ?? defaultRelayKeyFile()),
   }
 }

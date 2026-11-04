@@ -70,3 +70,13 @@ test('config file, overridden by flags', () => {
   expect(loadConfig({ config: f, hours: '10:00-11:00' }, env).hours?.start).toBe(600)
   expect(() => loadConfig({ config: `${dir}/missing.json` }, env)).toThrow(/config/)
 })
+
+test('relay mode needs no app token, and its URL must be https unless it is this machine', () => {
+  const env = { ...base, SLACK_INBOX_USER_TOKEN: 'xoxp-1' }
+  expect(() => loadConfig({}, env)).toThrow(/SLACK_INBOX_APP_TOKEN/)
+  const cfg = loadConfig({}, { ...env, SLACK_INBOX_RELAY_URL: 'https://relay.example' })
+  expect(cfg.relayUrl).toBe('https://relay.example')
+  expect(cfg.appToken).toBe('')
+  expect(loadConfig({}, { ...env, SLACK_INBOX_RELAY_URL: 'http://127.0.0.1:8799' }).relayUrl).toBe('http://127.0.0.1:8799')
+  expect(() => loadConfig({}, { ...env, SLACK_INBOX_RELAY_URL: 'http://relay.example' })).toThrow(/https/)
+})

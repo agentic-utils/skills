@@ -168,6 +168,24 @@ launchctl bootout gui/$(id -u)/local.slack-inbox        # stop and unload
 
 It points at the marketplace checkout (`~/.claude/plugins/marketplaces/agentic-utils/…`), which `/plugin marketplace update` keeps current; restart the agent after an update.
 
+## Relay mode: nothing lost while the laptop sleeps
+
+A laptop can't hold a socket while it is asleep. Messages sent meanwhile are lost, and if enough deliveries fail, Slack can turn events off for the app until someone turns them back on. In relay mode Slack posts each event over HTTP to a small hosted [Cloudflare Worker](relay/worker.ts), which seals it and queues it. The listener pulls the queue every 10 seconds while awake, and drains it on waking.
+
+- **What the relay holds:** Slack's signing secret and your public keys. No Slack token, and no private key.
+- **What it stores:** ciphertext, plus an event id and expiry time, deleted after 7 days. Only your machine's private key can open it.
+- **What it can't protect against:** each event is in plaintext in the Worker's memory for a moment before sealing, and whoever can deploy to that Cloudflare account could change the code to keep it. This protects stored data, not data in use, so choose the account accordingly.
+- **What stays local:** matching, thread lookups and your user token. Sessions read the same log file as before.
+
+Set it up:
+
+1. Run `bun src/cli.ts relay-keygen`. It writes the private key to `~/.config/slack-inbox/relay-key` (chmod 600) and prints the two public keys.
+2. Deploy `relay/` with a D1 database created from [`relay/schema.sql`](relay/schema.sql), a daily cron trigger, the public keys and your Slack user id as settings (see [`relay/wrangler.example.toml`](relay/wrangler.example.toml)), and `SLACK_SIGNING_SECRET` as a secret.
+3. In the Slack app settings, turn Socket Mode off and set the Event Subscriptions request URL to `https://<your-relay>/slack/events`.
+4. Set `relay_url` in the config file (or `SLACK_INBOX_RELAY_URL`), restart the listener, and run `bun src/cli.ts check`. The app-level token is no longer used.
+
+The relay stores events only for the Slack user it is set up for. If several people install the app, each needs their own relay.
+
 ## Push events into sessions
 
 The plugin ships a [channel](https://code.claude.com/docs/en/channels) MCP server, `slack-events`. It does not open its own Slack connection: it tails the listener's log, so the LaunchAgent stays the only Socket Mode client. Load the plugin as a channel when starting Claude Code:
