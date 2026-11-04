@@ -1,5 +1,5 @@
-// Cloudflare Worker entry for the relay: a D1 queue the listener empties as it collects, with a daily cron trigger
-// to delete what nobody collected and keep it under its size limit.
+// Cloudflare Worker entry for the relay: a D1 queue, with a daily cron trigger to delete events past their time limit
+// and keep it under its size limit.
 import { createRelay, MAX_AGE_MS, MAX_QUEUE_BYTES, type Queued, rowsToEvict, type Store } from './handler'
 
 type Env = {
@@ -25,9 +25,6 @@ const store = (db: Env['DB']): Store => ({
   async list(after, limit) {
     const r = await db.prepare('SELECT id, sealed FROM events WHERE id > ? ORDER BY id LIMIT ?').bind(after, limit).all()
     return r.results as Queued[]
-  },
-  async ack(through) {
-    await db.prepare('DELETE FROM events WHERE id <= ?').bind(through).run()
   },
 })
 

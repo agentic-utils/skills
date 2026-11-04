@@ -1,7 +1,7 @@
 // Relay mode, on the user's machine: the key pair, opening what the relay sealed, and pulling its queue.
 import { createDecipheriv, createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, sign } from 'node:crypto'
 import { closeSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs'
-import { ackMessage, pullMessage, SEAL_INFO } from '../relay/handler'
+import { pullMessage, SEAL_INFO } from '../relay/handler'
 import type { EventsApiPayload } from './match'
 
 export type RelayKeys = { seal: { d: string; x: string }; sign: { d: string; x: string } }
@@ -39,11 +39,7 @@ export function signPull(k: RelayKeys, time: string, after: string): string {
   return sign(null, Buffer.from(pullMessage(time, after)), jwkOf('Ed25519', k.sign)).toString('base64')
 }
 
-export function signAck(k: RelayKeys, time: string, through: string): string {
-  return sign(null, Buffer.from(ackMessage(time, through)), jwkOf('Ed25519', k.sign)).toString('base64')
-}
-
-export type Fetch = (url: string, init: { method?: string; headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<any> }>
+export type Fetch = (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<any> }>
 
 export type PullerDeps = {
   url: string
@@ -90,38 +86,12 @@ const retryable = (err: unknown) => {
 // Reads the queue from a cursor kept on disk, so a restart resumes where it stopped. Delivery is at least once: a
 // crash between handling an event and saving the cursor repeats that one event. An event that can never be opened or
 // handled is skipped and counted, or one bad row would block the queue for good. A retryable failure stops the pull
-// with the cursor where it is, so that event is tried again next time. Once a pull finishes, the relay is told to
-// delete what was collected. Nothing from the first skipped event on is deleted until the listener restarts, in case a
-// corrected key can still open it; they expire anyway.
+// with the cursor where it is, so that event is tried again next time.
 export function createPuller(d: PullerDeps) {
   const doFetch = d.fetch ?? (fetch as unknown as Fetch)
   const now = d.now ?? Date.now
   let after = readCursor(d.cursorFile)
   let failures = 0
-  let acked = 0
-  let keepFrom = Number.POSITIVE_INFINITY // the first event skipped since starting: nothing from here on is deleted
-  let ackWarned = false
-
-  // Never fails a pull: an event that isn't deleted now is deleted by the next ack, or when it expires.
-  const ack = async () => {
-    const through = Math.min(after, keepFrom - 1)
-    if (through <= acked) return
-    try {
-      const time = String(Math.floor(now() / 1000))
-      const q = String(through)
-      const res = await doFetch(`${d.url.replace(/\/$/, '')}/ack?through=${q}`, {
-        method: 'POST',
-        headers: { 'x-relay-time': time, 'x-relay-signature': signAck(d.keys, time, q) },
-        signal: AbortSignal.timeout(20_000),
-      })
-      if (!res.ok) throw new Error(`relay answered ${res.status}`)
-      acked = through
-      ackWarned = false
-    } catch (err) {
-      if (!ackWarned) d.log(`relay kept collected events, will try again: ${(err as Error).message}`)
-      ackWarned = true
-    }
-  }
 
   return {
     outage: () => failures >= FAILURES_BEFORE_OUTAGE,
@@ -156,7 +126,6 @@ export function createPuller(d: PullerDeps) {
               if (retryable(err)) throw err
               d.log(`relay event ${e.id} skipped: ${(err as Error).message}`)
               skipped++
-              keepFrom = Math.min(keepFrom, e.id)
             }
             if (e.id > after + 1) lost += e.id - after - 1
             after = e.id
@@ -166,7 +135,6 @@ export function createPuller(d: PullerDeps) {
           if (events.length === 0) break
         }
         failures = 0
-        await ack()
         return { handled, failures, lost, skipped }
       } catch (err) {
         failures++

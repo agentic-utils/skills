@@ -1,5 +1,5 @@
 // The hosted half of relay mode: receives Slack's Events API posts, seals each event to the user's public key and
-// queues the ciphertext until their machine has collected it, then deletes it. Web standards only, so it runs on Workers and under Bun tests.
+// queues the ciphertext for their machine to pull, keeping it for a while so it can be replayed. Web standards only, so it runs on Workers and under Bun tests.
 // It holds no Slack token and can't read what it has stored.
 
 export type Queued = { id: number; sealed: string }
@@ -8,7 +8,6 @@ export type Store = {
   // A repeated event_id (a Slack retry) is ignored, so retries are safe
   put(eventId: string, sealed: string, expiresAt: number): Promise<void>
   list(after: number, limit: number): Promise<Queued[]>
-  ack(through: number): Promise<void> // deletes everything up to and including this id
 }
 
 export type RelayConfig = {
@@ -27,11 +26,11 @@ export type RelayConfig = {
 const MAX_BODY = 1024 * 1024
 const CLOCK_SKEW_S = 300
 const STORE_BUDGET_MS = 2500 // Slack wants an answer within 3 seconds; past this, let it retry
-// How long an event waits for a machine that isn't collecting. Long enough for a holiday, and no longer: this is
-// company data held elsewhere, and collected events are deleted long before this.
+// How long an event is kept, collected or not: long enough to wait out a holiday and to replay recent messages, and no
+// longer, as this is the user's whole Slack held elsewhere.
 export const MAX_AGE_MS = 14 * 86_400_000
 // Half of D1's 500 MB free limit: this counts stored bytes plus an estimate, so the real file can be larger, and a
-// full database would make storing fail. Only a machine that has stopped collecting should ever get near it.
+// full database would make storing fail.
 export const MAX_QUEUE_BYTES = 250 * 1024 * 1024
 export const ROW_OVERHEAD_BYTES = 150 // event id, keys and indexes, on top of the sealed text
 const PULL_LIMIT = 100
@@ -97,7 +96,6 @@ export function rowsToEvict(rows: number, sealedBytes: number, maxBytes = MAX_QU
 }
 
 export const pullMessage = (time: string, after: string) => `pull:${time}:${after}`
-export const ackMessage = (time: string, through: string) => `ack:${time}:${through}`
 
 // Only what the listener's matching reads, which also keeps the stored queue small.
 export function trim(p: Record<string, any>): Record<string, unknown> {
@@ -180,25 +178,10 @@ export function createRelay(c: RelayConfig) {
     return json({ events: await c.store.list(Number(after), PULL_LIMIT) })
   }
 
-  const ack = async (req: Request, url: URL) => {
-    const through = url.searchParams.get('through') ?? ''
-    const time = req.headers.get('x-relay-time') ?? ''
-    const given = req.headers.get('x-relay-signature') ?? ''
-    if (!/^\d+$/.test(through) || !withinSkew(time, now())) return new Response('unauthorised', { status: 401 })
-    let good = false
-    try {
-      good = await verify(c.verifyKey, ackMessage(time, through), given)
-    } catch {}
-    if (!good) return new Response('unauthorised', { status: 401 })
-    await c.store.ack(Number(through))
-    return json({})
-  }
-
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url)
     if (req.method === 'POST' && url.pathname === '/slack/events') return events(req)
     if (req.method === 'GET' && url.pathname === '/pull') return pull(req, url)
-    if (req.method === 'POST' && url.pathname === '/ack') return ack(req, url)
     if (req.method === 'GET' && url.pathname === '/health') return json({ ok: true })
     return new Response('not found', { status: 404 })
   }
