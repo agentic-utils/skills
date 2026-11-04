@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { createCipheriv, createHmac, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, verify as edVerify } from 'node:crypto'
-import { createRelay, type Queued, RETENTION_MS, SEAL_INFO, type Store, trim } from '../relay/handler'
+import { createRelay, MAX_QUEUE_BYTES, type Queued, ROW_OVERHEAD_BYTES, rowsToEvict, SEAL_INFO, type Store, trim } from '../relay/handler'
 import { createPuller, type Fetch, generateRelayKeys, openSealed, publicKeys, signPull } from './pull'
 
 const NOW = 1_800_000_000_000
@@ -29,11 +29,11 @@ async function nodeVerify(publicKey: string, message: string, signature: string)
 }
 
 function memStore() {
-  const rows: (Queued & { eventId: string; expiresAt: number })[] = []
+  const rows: (Queued & { eventId: string })[] = []
   let seq = 0
   const store: Store = {
-    async put(eventId, sealed, expiresAt) {
-      if (!rows.some(r => r.eventId === eventId)) rows.push({ id: ++seq, eventId, sealed, expiresAt })
+    async put(eventId, sealed) {
+      if (!rows.some(r => r.eventId === eventId)) rows.push({ id: ++seq, eventId, sealed })
     },
     async list(after, limit) {
       return rows.filter(r => r.id > after).slice(0, limit).map(({ id, sealed }) => ({ id, sealed }))
@@ -83,11 +83,24 @@ test('only the fields the listener reads are stored', async () => {
   expect(trim(callback()).event).toMatchObject({ channel: 'C1', ts: '1.000100' })
 })
 
-test('rows expire after the retention, which outlasts a long weekend', async () => {
-  const { rows, store } = memStore()
-  await setup(store)(post(callback()))
-  expect(rows[0].expiresAt).toBe(NOW + RETENTION_MS)
-  expect(RETENTION_MS).toBeGreaterThan(5 * 86_400_000)
+test('nothing is evicted under the budget, and the budget is at most half of the 500 MB cap', () => {
+  expect(rowsToEvict(0, 0)).toBe(0)
+  expect(rowsToEvict(1000, 1000 * 720)).toBe(0)
+  expect(MAX_QUEUE_BYTES).toBeLessThanOrEqual(250 * 1024 * 1024)
+})
+
+test('over budget, enough of the oldest rows go to get back under it in one pass', () => {
+  const rows = 1000
+  const bytes = 1000 * 850
+  const max = 1000 * 500
+  const evict = rowsToEvict(rows, bytes, max)
+  expect(evict).toBe(500)
+  const left = rows - evict
+  expect(left * (bytes / rows + ROW_OVERHEAD_BYTES)).toBeLessThanOrEqual(max)
+})
+
+test('eviction never asks for more rows than exist', () => {
+  expect(rowsToEvict(2, 10_000, 1)).toBe(2)
 })
 
 test('a bad signature or a stale timestamp is refused and stores nothing', async () => {
@@ -168,6 +181,31 @@ test('an event that will not open is logged and skipped, and the queue keeps mov
   expect((await p.pull()).handled).toBe(2)
   expect(seen).toEqual(['good'])
   expect(logs).toHaveLength(1)
+})
+
+test('a jump in ids is reported as lost events, once, and the cursor carries on', async () => {
+  const rows = [{ id: 5, sealed: await nodeSeal(pubs.seal, JSON.stringify({ event_id: 'a' })) }, { id: 6, sealed: await nodeSeal(pubs.seal, JSON.stringify({ event_id: 'b' })) }]
+  const f = tmp()
+  writeFileSync(f, '2')
+  let served = false
+  const fetchFn: Fetch = async () => ({ ok: true, status: 200, json: async () => ({ events: served ? [] : ((served = true), rows) }) })
+  const p = createPuller({ url: 'https://r.example', keys, cursorFile: f, now: () => NOW, log: () => {}, fetch: fetchFn, handle: async () => {} })
+  expect(await p.pull()).toMatchObject({ handled: 2, lost: 2 })
+  expect(readFileSync(f, 'utf8')).toBe('6')
+  expect((await p.pull()).lost).toBe(0)
+})
+
+test('ping checks the key without reading the queue', async () => {
+  const { rows, store } = memStore()
+  const relay = setup(store)
+  await relay(post(callback()))
+  const seen: string[] = []
+  const f = tmp()
+  await createPuller({ url: 'https://r.example', keys, cursorFile: f, now: () => NOW, log: () => {}, fetch: async (url, init) => (seen.push(url), viaRelay(relay)(url, init)), handle: async () => { throw new Error('should not handle') } }).ping()
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toContain(`after=${Number.MAX_SAFE_INTEGER}`)
+  expect(rows).toHaveLength(1)
+  await expect(createPuller({ url: 'https://r.example', keys: generateRelayKeys(), cursorFile: f, now: () => NOW, log: () => {}, fetch: viaRelay(relay), handle: async () => {} }).ping()).rejects.toThrow('401')
 })
 
 test('three failed pulls in a row count as an outage, and one success clears it', async () => {

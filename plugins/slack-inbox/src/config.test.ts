@@ -30,7 +30,10 @@ test('hours', () => {
   expect(() => parseHours('09:00-09:00')).toThrow()
 })
 
-const base = { SLACK_INBOX_CONFIG: undefined, HOME: dir }
+// its own empty config, so a real one in the home directory can't change these results
+const emptyConfig = `${dir}/empty-config.json`
+writeFileSync(emptyConfig, '{}')
+const base = { SLACK_INBOX_CONFIG: emptyConfig, HOME: dir }
 
 test('tokens from env, and prefix checked', () => {
   const cfg = loadConfig({}, { ...base, SLACK_INBOX_APP_TOKEN: 'xapp-1', SLACK_INBOX_USER_TOKEN: 'xoxp-1', SLACK_INBOX_ALLOW_BOTS: 'B1, A2' })

@@ -40,10 +40,8 @@ async function check(flags: Parameters<typeof loadConfig>[0]) {
   const groups = await myGroups(cfg.userToken, id.userId)
   console.log(`user groups: member of ${groups.size}`)
   if (cfg.relayUrl) {
-    // a throwaway handler and cursor: this drains nothing the real listener will miss, as its cursor is its own
-    const res = await createPuller({ url: cfg.relayUrl, keys: JSON.parse(readSecretFile(cfg.relayKeyFile)) as RelayKeys, cursorFile: '/dev/null', handle: async () => {}, log: () => {} }).pull()
-    console.log(res.error ? `relay: FAILED ${res.error}` : `relay: ok, pulling from ${cfg.relayUrl}`)
-    if (res.error) process.exit(1)
+    await createPuller({ url: cfg.relayUrl, keys: JSON.parse(readSecretFile(cfg.relayKeyFile)) as RelayKeys, cursorFile: '/dev/null', handle: async () => {}, log: () => {} }).ping()
+    console.log(`relay: ok, pulling from ${cfg.relayUrl}`)
   } else {
     await socketUrl(cfg.appToken) // an unused URL just expires
     console.log('app token: ok, Socket Mode connection allowed')

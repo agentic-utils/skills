@@ -28,7 +28,7 @@ Events are pushed into the session by the plugin's `slack-events` channel, if Cl
 - **Coordinating session**: call `subscribe_inbox`. Each `via="inbox"` event is addressed to the user; route it to the session that owns that work, or start one, passing the permalink. `include_own: true` also pushes everything the user posts (self-DM, DMs, group DMs, channels, threads) as `trigger="own"`, on a separate cap (`inbox:own`, 20 a minute). Skip events with `via_claude="true"`: a Claude session posted them as the user. The listener can log own posts without any session asking, via `SLACK_INBOX_INCLUDE_OWN=1`.
 - **Session working a thread**: call `subscribe_conversation` with the thread's permalink (or `conversation` + `thread_ts`). Every new reply arrives, mentioned or not, even in threads the user is not in. `include_own: true` adds the user's own replies. Unsubscribe when done.
 - **Whole conversation**: `subscribe_conversation` with just a channel, DM or group DM id. Capped at 20 pushes a minute per subscription (`rate_limited` reports the rest); prefer a thread where one will do.
-- Subscribing refuses a conversation the user isn't a member of, or a Slack Connect one. A `status` event (disconnected, paused, stopped, not_running, stalled) means messages may be missing until the next `connected`.
+- Subscribing refuses a conversation the user isn't a member of, or a Slack Connect one. A `status` event (disconnected, paused, stopped, not_running, stalled, lost) means messages may be missing until the next `connected`.
 - Subscriptions survive `--resume`; what was logged while the session was closed arrives when it reconnects.
 
 Without the channel flag, arm a Monitor on the log instead:

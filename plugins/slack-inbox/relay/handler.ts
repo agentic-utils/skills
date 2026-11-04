@@ -6,7 +6,7 @@ export type Queued = { id: number; sealed: string }
 
 export type Store = {
   // A repeated event_id (a Slack retry) is ignored, so retries are safe
-  put(eventId: string, sealed: string, expiresAt: number): Promise<void>
+  put(eventId: string, sealed: string): Promise<void>
   list(after: number, limit: number): Promise<Queued[]>
 }
 
@@ -25,7 +25,10 @@ export type RelayConfig = {
 const MAX_BODY = 1024 * 1024
 const CLOCK_SKEW_S = 300
 const STORE_BUDGET_MS = 2500 // Slack wants an answer within 3 seconds; past this, let it retry
-export const RETENTION_MS = 7 * 86_400_000
+// Half of D1's 500 MB free limit: this counts stored bytes plus an estimate, so the real file can be larger, and a
+// full database would make storing fail. The margin also gives weeks of warning if the daily trim stops running.
+export const MAX_QUEUE_BYTES = 250 * 1024 * 1024
+export const ROW_OVERHEAD_BYTES = 150 // event id, keys and indexes, on top of the sealed text
 const PULL_LIMIT = 100
 
 const enc = new TextEncoder()
@@ -79,6 +82,14 @@ async function slackSignatureOk(secret: string, timestamp: string, body: string,
   if (!/^[0-9a-f]{64}$/.test(hex)) return false
   const sig = Uint8Array.from(hex.match(/../g)!, h => Number.parseInt(h, 16))
   return crypto.subtle.verify('HMAC', key, sig, enc.encode(`v0:${timestamp}:${body}`)) // constant time
+}
+
+// How many of the oldest rows to delete to get back under the budget. There is no time limit: events stay until
+// space is needed. Rounds up, so one pass is enough.
+export function rowsToEvict(rows: number, sealedBytes: number, maxBytes = MAX_QUEUE_BYTES): number {
+  const used = sealedBytes + rows * ROW_OVERHEAD_BYTES
+  if (rows === 0 || used <= maxBytes) return 0
+  return Math.min(rows, Math.ceil((used - maxBytes) / (used / rows)))
 }
 
 export const pullMessage = (time: string, after: string) => `pull:${time}:${after}`
@@ -140,7 +151,7 @@ export function createRelay(c: RelayConfig) {
       timer = setTimeout(() => resolve('over'), STORE_BUDGET_MS)
     })
     try {
-      const stored = sealTo(c.sealKey, JSON.stringify(trim(p))).then(sealed => c.store.put(p.event_id, sealed, now() + RETENTION_MS))
+      const stored = sealTo(c.sealKey, JSON.stringify(trim(p))).then(sealed => c.store.put(p.event_id, sealed))
       if ((await Promise.race([stored, over])) === 'over') return new Response('store slow', { status: 503 })
     } catch {
       return new Response('store failed', { status: 503 })
