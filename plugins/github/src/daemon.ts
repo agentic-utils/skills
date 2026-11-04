@@ -31,6 +31,8 @@ const POLL_MS = Number(process.env.GH_PR_EVENTS_POLL_SECONDS ?? 15) * 1000
 // its forward is first retried after this long, then twice as long each time up to an hour (env: tests only)
 const FORWARD_RETRY_MS = Number(process.env.GH_PR_EVENTS_FORWARD_RETRY_MS ?? 5 * 60_000)
 const FORWARD_RETRY_MAX_MS = Math.max(FORWARD_RETRY_MS, 60 * 60_000)
+// polling pauses until the allowance resets with this few calls left, so merges and your own commands still work
+const POLL_RESERVE = Number(process.env.GH_PR_EVENTS_POLL_RESERVE ?? 500)
 const SWEEP_MS = 30 * 60_000 // a polled PR is caught up in full this often even when its probes saw no change
 // GitHub refusing the forward: one is allowed per repo and someone else holds it, or we're not admin
 const TAKEN = /already exists/i
@@ -126,6 +128,7 @@ export async function startDaemon() {
   const polled = new Map<string, Poll>() // repos GitHub won't forward to us, polled instead
   // ponytail: never pruned (a few short strings per PR head polled); prune with the PR if polling gets heavy use
   const etags = new Map<string, string>() // API path -> its last ETag, for conditional polls
+  let pollPause = 0 // no polling before this: the allowance is nearly used
   const pollFails = new Map<string, number>() // key -> failed polls in a row
   const waits = new Set<Timer>() // pending restarts and catch-up retries, cleared by stop()
   const later = (fn: () => unknown, ms: number) => {
@@ -521,6 +524,18 @@ export async function startDaemon() {
     }
   }
 
+  // Stops every poll until the allowance resets; its sessions are told once, as silence would look like a quiet PR.
+  function pausePolling(until: number) {
+    if (!(until > Date.now()) || until <= pollPause) return
+    const pausing = pollPause <= Date.now()
+    pollPause = until
+    if (!pausing) return
+    const at = new Date(until).toISOString()
+    log(`GitHub allowance low: polling paused until ${at}`)
+    for (const repo of polled.keys())
+      for (const k of inRepo(repo)) emitTo(k, `pr-events: polling ${subs.get(k)!.pr} paused until ${at}, GitHub allowance nearly used; it resumes by itself`, { event: 'polling' })
+  }
+
   // Whether the resource changed since the last call, by a conditional GET: GitHub answers an unchanged one with a 304,
   // which doesn't count against the rate limit (gh exits 1 on it, headers still printed). wait: how long GitHub asks
   // us to hold off (X-Poll-Interval, or Retry-After on a refusal), in ms.
@@ -531,6 +546,8 @@ export async function startDaemon() {
     const head = out.split(/\r?\n\r?\n/)[0]
     const h = (name: string) => head.match(new RegExp(`^${name}:\\s*(.+?)\\s*$`, 'im'))?.[1]
     const wait = Math.max(Number(h('x-poll-interval')) || 0, Number(h('retry-after')) || 0) * 1000
+    const left = h('x-ratelimit-remaining')
+    if (left !== undefined && Number(left) <= POLL_RESERVE) pausePolling(Number(h('x-ratelimit-reset')) * 1000)
     const status = Number(head.match(/^HTTP\/\S+ (\d+)/)?.[1])
     if (status === 304) return { changed: false, wait, keep: () => {} }
     if (code !== 0) throw Object.assign(new Error(why), { wait })
@@ -552,6 +569,7 @@ export async function startDaemon() {
       pollFails.delete(key)
       return Math.max(0, ...probes.map(p => p.wait))
     } catch (e: any) {
+      if (Date.now() < pollPause) return 0 // refused for the allowance: already said, and it resumes by itself
       const fails = (pollFails.get(key) ?? 0) + 1
       pollFails.set(key, fails)
       log(`poll of ${sub.pr} failed (${e?.message ?? e})`)
@@ -561,6 +579,7 @@ export async function startDaemon() {
   }
   const pollCheck = () => {
     const now = Date.now()
+    if (now < pollPause) return
     for (const [repo, p] of polled) {
       if (now >= p.retry) {
         p.backoff = Math.min(p.backoff * 2, FORWARD_RETRY_MAX_MS)
