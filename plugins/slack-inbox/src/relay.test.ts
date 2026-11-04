@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from '
 import { tmpdir } from 'node:os'
 import { createCipheriv, createHmac, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, verify as edVerify } from 'node:crypto'
 import { createRelay, MAX_AGE_MS, MAX_QUEUE_BYTES, type Queued, ROW_OVERHEAD_BYTES, rowsToEvict, SEAL_INFO, type Store, trim } from '../relay/handler'
-import { createPuller, type Fetch, generateRelayKeys, openSealed, publicKeys, signAck, signPull } from './pull'
+import { createPuller, type Fetch, generateRelayKeys, openSealed, publicKeys, signPull } from './pull'
 
 const NOW = 1_800_000_000_000
 const SECRET = 'signing-secret'
@@ -37,9 +37,6 @@ function memStore() {
     },
     async list(after, limit) {
       return rows.filter(r => r.id > after).slice(0, limit).map(({ id, sealed }) => ({ id, sealed }))
-    },
-    async ack(through) {
-      rows = rows.filter(r => r.id > through)
     },
   }
   return { get rows() { return rows }, store }
@@ -133,7 +130,7 @@ test('a Slack retry of the same event is stored once', async () => {
 })
 
 test('a failing store answers 503 so Slack retries', async () => {
-  const store: Store = { put: async () => { throw new Error('down') }, list: async () => [], ack: async () => {} }
+  const store: Store = { put: async () => { throw new Error('down') }, list: async () => [] }
   expect((await setup(store)(post(callback()))).status).toBe(503)
 })
 
@@ -154,7 +151,7 @@ test('pull needs a signature from the private key, for this cursor and a recent 
 })
 
 const tmp = () => `${mkdtempSync(`${tmpdir()}/slack-inbox-pull-`)}/cursor`
-const viaRelay = (relay: (r: Request) => Promise<Response>): Fetch => async (url, init) => relay(new Request(url, { method: init.method, headers: init.headers }))
+const viaRelay = (relay: (r: Request) => Promise<Response>): Fetch => async (url, init) => relay(new Request(url, { headers: init.headers }))
 
 test('the puller drains the queue in order, and a restart resumes after what it handled', async () => {
   const { store } = memStore()
@@ -282,67 +279,13 @@ test('the cursor file is replaced whole, private to the user, and leaves nothing
   expect(existsSync(`${f}.tmp`)).toBe(false)
 })
 
-const ackReq = (through: string, opts: { time?: number; k?: typeof keys; sign?: typeof signAck } = {}) => {
-  const time = String(opts.time ?? NOW / 1000)
-  return new Request(`https://relay.example/ack?through=${through}`, { method: 'POST', headers: { 'x-relay-time': time, 'x-relay-signature': (opts.sign ?? signAck)(opts.k ?? keys, time, through) } })
-}
-
-test('an event is stored with its expiry', async () => {
-  const q = memStore()
-  await setup(q.store)(post(callback()))
-  expect(q.rows[0].expiresAt).toBe(NOW + MAX_AGE_MS)
-})
-
-test('deleting needs its own signature, and takes only what it names', async () => {
-  const q = memStore()
-  const relay = setup(q.store)
-  for (const id of ['a', 'b', 'c']) await relay(post(callback({ event_id: id })))
-  expect((await relay(ackReq('2', { k: generateRelayKeys() }))).status).toBe(401)
-  expect((await relay(ackReq('2', { time: NOW / 1000 - 301 }))).status).toBe(401)
-  expect((await relay(ackReq('2', { sign: signPull }))).status).toBe(401) // a captured pull signature can't delete
-  expect((await relay(new Request('https://relay.example/ack', { method: 'POST' }))).status).toBe(401)
-  expect(q.rows).toHaveLength(3)
-  expect((await relay(ackReq('2'))).status).toBe(200)
-  expect(q.rows.map(r => r.eventId)).toEqual(['c'])
-})
-
-const puller = (relay: (r: Request) => Promise<Response>, f: string, over: Record<string, unknown> = {}) =>
-  createPuller({ url: 'https://r.example', keys, cursorFile: f, now: () => NOW, log: () => {}, fetch: viaRelay(relay), handle: async () => {}, ...over })
-
-test('collected events are deleted from the relay, and a restart deletes what an earlier run left', async () => {
-  const q = memStore()
-  const relay = setup(q.store)
-  for (const id of ['a', 'b']) await relay(post(callback({ event_id: id })))
-  const f = tmp()
-  await puller(relay, f, { fetch: async (url: string, init: any) => (url.includes('/ack') ? { ok: false, status: 500, json: async () => ({}) } : viaRelay(relay)(url, init)) }).pull()
-  expect(q.rows).toHaveLength(2)
-  expect(readFileSync(f, 'utf8')).toBe('2')
-  await puller(relay, f).pull()
-  expect(q.rows).toHaveLength(0)
-})
-
-test('an event that could not be opened is kept, as is everything after it', async () => {
-  const q = memStore()
-  const relay = setup(q.store)
-  for (const id of ['good', 'bad', 'later']) await relay(post(callback({ event_id: id })))
-  q.rows[1].sealed = Buffer.alloc(80).toString('base64')
-  const p = puller(relay, tmp())
-  expect(await p.pull()).toMatchObject({ handled: 3, skipped: 1 })
-  expect(q.rows.map(r => r.eventId)).toEqual(['bad', 'later'])
-  await relay(post(callback({ event_id: 'newer' })))
-  await p.pull()
-  expect(q.rows.map(r => r.eventId)).toEqual(['bad', 'later', 'newer'])
-})
-
-test('a relay that cannot delete yet does not fail the pull, and says so once', async () => {
+test('an event is stored with its expiry, and collecting it leaves it there to replay', async () => {
   const q = memStore()
   const relay = setup(q.store)
   await relay(post(callback()))
-  const logs: string[] = []
-  const notFound = async (url: string, init: any) => (url.includes('/ack') ? { ok: false, status: 404, json: async () => ({}) } : viaRelay(relay)(url, init))
-  const p = puller(relay, tmp(), { fetch: notFound, log: (m: string) => logs.push(m) })
-  expect(await p.pull()).toMatchObject({ handled: 1, failures: 0 })
-  expect(await p.pull()).toMatchObject({ handled: 0, failures: 0 })
-  expect(p.outage()).toBe(false)
-  expect(logs).toHaveLength(1)
+  expect(q.rows[0].expiresAt).toBe(NOW + MAX_AGE_MS)
+  const p = createPuller({ url: 'https://r.example', keys, cursorFile: tmp(), now: () => NOW, log: () => {}, fetch: viaRelay(relay), handle: async () => {} })
+  expect((await p.pull()).handled).toBe(1)
+  expect(q.rows).toHaveLength(1)
+  expect((await relay(new Request('https://relay.example/ack?through=1', { method: 'POST' }))).status).toBe(404)
 })
