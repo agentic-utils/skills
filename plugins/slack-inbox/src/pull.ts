@@ -74,11 +74,19 @@ const readCursor = (path: string) => {
 }
 
 // `lost`: how many events the relay dropped before they were pulled, seen as a jump in its ids.
-export type PullResult = { handled: number; failures: number; lost: number; error?: string }
+// `skipped`: how many it held that could never be opened or handled.
+export type PullResult = { handled: number; failures: number; lost: number; skipped: number; error?: string }
+
+// A failure that says nothing about the event (a full disk, Slack unavailable), so the event must wait rather than go.
+const retryable = (err: unknown) => {
+  const e = err as { retry?: boolean; code?: unknown }
+  return e.retry === true || (typeof e.code === 'string' && /^E[A-Z]+$/.test(e.code))
+}
 
 // Reads the queue from a cursor kept on disk, so a restart resumes where it stopped. Delivery is at least once: a
-// crash between handling an event and saving the cursor repeats that one event. An event it can't open is logged
-// and skipped, or one bad row would block the queue for good.
+// crash between handling an event and saving the cursor repeats that one event. An event that can never be opened or
+// handled is skipped and counted, or one bad row would block the queue for good. A retryable failure stops the pull
+// with the cursor where it is, so that event is tried again next time.
 export function createPuller(d: PullerDeps) {
   const doFetch = d.fetch ?? (fetch as unknown as Fetch)
   const now = d.now ?? Date.now
@@ -100,6 +108,7 @@ export function createPuller(d: PullerDeps) {
     async pull(): Promise<PullResult> {
       let handled = 0
       let lost = 0
+      let skipped = 0
       try {
         for (;;) {
           const time = String(Math.floor(now() / 1000))
@@ -111,12 +120,14 @@ export function createPuller(d: PullerDeps) {
           if (!res.ok) throw new Error(`relay answered ${res.status}`)
           const { events } = (await res.json()) as { events: { id: number; sealed: string }[] }
           for (const e of events) {
-            if (e.id > after + 1) lost += e.id - after - 1
             try {
               await d.handle(JSON.parse(openSealed(d.keys, e.sealed)))
             } catch (err) {
+              if (retryable(err)) throw err
               d.log(`relay event ${e.id} skipped: ${(err as Error).message}`)
+              skipped++
             }
+            if (e.id > after + 1) lost += e.id - after - 1
             after = e.id
             saveCursor(d.cursorFile, after)
             handled++
@@ -124,10 +135,10 @@ export function createPuller(d: PullerDeps) {
           if (events.length === 0) break
         }
         failures = 0
-        return { handled, failures, lost }
+        return { handled, failures, lost, skipped }
       } catch (err) {
         failures++
-        return { handled, failures, lost, error: (err as Error).message }
+        return { handled, failures, lost, skipped, error: (err as Error).message }
       }
     },
   }
