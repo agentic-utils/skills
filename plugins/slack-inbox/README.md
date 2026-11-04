@@ -179,6 +179,16 @@ A laptop can't hold a socket while it is asleep. Messages sent meanwhile are los
 - **What it can't protect against:** each event is in plaintext in the Worker's memory for a moment before sealing, and whoever can deploy to that Cloudflare account could change the code to keep it. This protects stored data, not data in use, so choose the account accordingly.
 - **What stays local:** matching, thread lookups and your user token. Sessions read the same log file as before.
 
+To read recent messages again, in full:
+
+```bash
+bun src/cli.ts replay --since 2d                  # what was addressed to you
+bun src/cli.ts replay --since 12h --all           # every message
+bun src/cli.ts replay --since 2d --channel C0123456789
+```
+
+It writes a new file next to the log, readable only by you, with each record marked `"replayed":true`, and prints counts, never message text. It can run beside the listener: it doesn't touch the log, the listener's place in the queue or any session. Slack Connect messages not addressed to you stay out, even with `--all`. Nothing cleans these files up, so delete them when you're done, as they hold other people's full messages. Each replay reads the whole queue, at one Worker request per 100 events.
+
 Set it up:
 
 1. Run `bun src/cli.ts relay-keygen`. It writes the private key to `~/.config/slack-inbox/relay-key` (chmod 600) and prints the two public keys.

@@ -37,6 +37,10 @@ Without the channel flag, arm a Monitor on the log instead:
 tail -n 0 -F ~/Library/Logs/slack-inbox/events.jsonl | grep --line-buffered -E '"kind":"message"|"state":"(disconnected|stopped)"'
 ```
 
+## Replay
+
+`bun src/cli.ts replay --since 2d` (add `--all`, `--channel` or `--until`) writes what the relay still holds, up to 14 days, to a new file and prints its path and counts. Don't print that file's text unless the user asks for it, and only the parts they need: it holds other people's full messages. Remind the user to delete it when done.
+
 ## Safety
 
 - An event with `external="true"` is from Slack Connect (people outside the user's organisation). It is read-only: tell the user, never reply or post there, and never hand it to another session to act on in Slack.
