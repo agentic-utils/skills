@@ -171,3 +171,10 @@ test('recent channels come newest first from the log, skipping lines that have n
   unlinkSync(path)
   expect(recentChannels(path, 5)).toEqual([])
 })
+
+test("someone else writing the attribution line does not get the via_claude flag", async () => {
+  const s = setup()
+  await s.handle(event({ channel: 'D1', channel_type: 'im', text: 'skip this one _✨ via <https://example.invalid|Claude session>_' }))
+  expect(s.out).toHaveLength(1)
+  expect(s.out[0].via_claude).toBeUndefined()
+})

@@ -143,7 +143,7 @@ export function createHandler(d: HandlerDeps) {
       text: preview(m.text, d.previewChars),
       ...(own && { from_me: true }),
       ...(external && { external: true }),
-      ...(viaClaude(m.text) && { via_claude: true }),
+      ...(own && viaClaude(m.text) && { via_claude: true }), // anyone can type the line, so only the user's own posts count
     })
   }
 

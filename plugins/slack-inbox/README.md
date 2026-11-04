@@ -34,7 +34,7 @@ Your own posts add one more, when asked for: set `SLACK_INBOX_INCLUDE_OWN=1` on 
 | --------- | ------------------------------------------------------------------------------------------------------ |
 | `own`     | A message you posted anywhere you are: DMs (your self-DM included), group DMs, channels and threads |
 
-Such a record has `"from_me":true`. Any record whose text ends with the attribution line a Claude session adds when it posts as you (`_✨ via <…|Claude session>_`) also has `"via_claude":true`, so a coordinating session can skip its own posts.
+Such a record has `"from_me":true`. If its text ends with the attribution line a Claude session adds when it posts as you (`_✨ via <…|Claude session>_`), it also has `"via_claude":true`, so a coordinating session can skip its own posts. Someone else who writes that line gets no flag.
 
 A session's subscriptions add two more, logged whether or not the message is addressed to you:
 
