@@ -1,7 +1,7 @@
 // The listener: one Socket Mode connection, held open inside working hours, appending a JSONL line per match.
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { Config } from './config'
+import { type Config, readSecretFile } from './config'
 import { inHours } from './hours'
 import {
   type EventsApiPayload,
@@ -19,6 +19,7 @@ import {
   viaClaude,
   watched,
 } from './match'
+import { createPuller, type RelayKeys } from './pull'
 import { inThread, myGroups, newestMessageAt, socketUrl, userName, whoami } from './slack'
 import { readWatches, type Watches, wantsOwnInbox } from './subs'
 
@@ -27,6 +28,7 @@ const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack
 const THREAD_TTL_MS = 30 * 86_400_000 // forget a thread the user hasn't touched in 30 days
 const NEGATIVE_TTL_MS = 10 * 60_000 // re-ask about a thread the user wasn't in after 10 minutes
 const TICK_MS = 15_000
+const RELAY_TICK_MS = 10_000 // how often relay mode pulls while awake, so at most this late
 const SLEPT_MS = 30_000 // a tick this late means the machine slept, so the socket is probably dead
 const HELLO_TIMEOUT_MS = 30_000 // a socket that opens but never says hello would otherwise block reconnecting for good
 const SILENT_MS = 60_000 // Slack pings about every 10 seconds, so this much silence means the socket is dead
@@ -269,8 +271,49 @@ export async function run(cfg: Config) {
   let lastEventAt = 0
   let stalled = false
   let stallCheckAt = 0
+  const received = (payload: EventsApiPayload) => {
+    lastEventAt = Date.now()
+    if (payload.event?.channel) noteActive(payload.event.channel)
+    if (stalled) {
+      stalled = false
+      status('connected', 'events are arriving again')
+    }
+    return handle(payload)
+  }
+
+  // --- relay mode: Slack posts to a hosted relay, and this pulls what it sealed ---
+  const puller = cfg.relayUrl
+    ? createPuller({ url: cfg.relayUrl, keys: JSON.parse(readSecretFile(cfg.relayKeyFile)) as RelayKeys, cursorFile: `${cfg.stateDir}/relay-cursor`, handle: received, log })
+    : null
+  let relaySince: number | undefined
+  let relayDown = false
+  let pulling = false
+  const pullRelay = async () => {
+    if (!puller || pulling) return
+    pulling = true
+    try {
+      const r = await puller.pull()
+      if (r.error) {
+        if (r.failures === 1) log(`relay pull failed: ${r.error}`)
+        if (puller.outage() && !relayDown) {
+          relayDown = true
+          status('disconnected', `relay unreachable: ${r.error}`)
+        }
+        return
+      }
+      if (relayDown || relaySince === undefined) {
+        relayDown = false
+        relaySince = Date.now()
+        status('connected', `pulling from ${cfg.relayUrl}`)
+      }
+    } finally {
+      pulling = false
+    }
+  }
+
   const checkDelivery = async (now: number) => {
-    if (stalled || health.helloAt === undefined || now - stallCheckAt < STALL_CHECK_MS) return
+    const connectedAt = puller ? relaySince : health.helloAt
+    if (stalled || connectedAt === undefined || now - stallCheckAt < STALL_CHECK_MS) return
     stallCheckAt = now
     let newestAt = 0
     for (const channel of active.keys()) {
@@ -280,7 +323,7 @@ export async function run(cfg: Config) {
         log(`delivery check ${channel} failed: ${(e as Error).message}`) // says nothing about delivery, so not a stall
       }
     }
-    if (ws && deliveryStalled({ now, newestAt, lastEventAt, connectedAt: health.helloAt })) {
+    if (deliveryStalled({ now, newestAt, lastEventAt, connectedAt })) {
       stalled = true
       status('stalled', "slack has newer messages than the last event received; check the app's Enable events setting in Slack app management")
     }
@@ -348,13 +391,7 @@ export async function run(cfg: Config) {
             later(0)
           }
         } else if (msg.type === 'events_api' && msg.payload) {
-          lastEventAt = Date.now()
-          if (msg.payload.event?.channel) noteActive(msg.payload.event.channel)
-          if (stalled) {
-            stalled = false
-            status('connected', 'events are arriving again')
-          }
-          handle(msg.payload).catch(e => log(`event failed: ${(e as Error).message}`))
+          received(msg.payload).catch(e => log(`event failed: ${(e as Error).message}`))
         }
       }
       sock.onclose = ev => {
@@ -402,13 +439,14 @@ export async function run(cfg: Config) {
     }
     paused = false
     // connect first: right after a wake this refresh can wait out a 30 second timeout
-    if (!ws && !connecting && now >= retryAt) await connect()
+    if (puller) await pullRelay()
+    else if (!ws && !connecting && now >= retryAt) await connect()
     if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
     await checkDelivery(now)
     saveThreads()
   }
 
-  const timer = setInterval(() => tick().catch(e => log(`tick failed: ${(e as Error).message}`)), TICK_MS)
+  const timer = setInterval(() => tick().catch(e => log(`tick failed: ${(e as Error).message}`)), puller ? RELAY_TICK_MS : TICK_MS)
   const shutdown = (code = 0) => {
     if (stopping) return
     stopping = true

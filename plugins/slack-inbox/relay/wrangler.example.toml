@@ -1,0 +1,18 @@
+# For local runs (`wrangler dev --local`). A deployed relay can use this, or its own infrastructure as code.
+name = "slack-inbox-relay"
+main = "worker.ts"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["17 3 * * *"] # deletes rows past their expiry
+
+[[d1_databases]]
+binding = "DB"
+database_name = "slack-inbox-relay"
+database_id = "local"
+
+[vars]
+RELAY_SEAL_PUBLIC_KEY = "from `slack-inbox relay-keygen`"
+RELAY_VERIFY_PUBLIC_KEY = "from `slack-inbox relay-keygen`"
+RELAY_OWNER_USER_ID = "your Slack user id"
+# SLACK_SIGNING_SECRET is a secret, never a var: `wrangler secret put SLACK_SIGNING_SECRET`
