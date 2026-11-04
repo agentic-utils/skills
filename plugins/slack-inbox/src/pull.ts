@@ -62,7 +62,8 @@ const readCursor = (path: string) => {
   }
 }
 
-export type PullResult = { handled: number; failures: number; error?: string }
+// `lost`: how many events the relay dropped before they were pulled, seen as a jump in its ids.
+export type PullResult = { handled: number; failures: number; lost: number; error?: string }
 
 // Reads the queue from a cursor kept on disk, so a restart resumes where it stopped. Delivery is at least once: a
 // crash between handling an event and saving the cursor repeats that one event. An event it can't open is logged
@@ -75,8 +76,19 @@ export function createPuller(d: PullerDeps) {
 
   return {
     outage: () => failures >= FAILURES_BEFORE_OUTAGE,
+    // Proves the relay accepts this key, without reading the queue: nothing is newer than the largest possible id
+    async ping(): Promise<void> {
+      const time = String(Math.floor(now() / 1000))
+      const q = String(Number.MAX_SAFE_INTEGER)
+      const res = await doFetch(`${d.url.replace(/\/$/, '')}/pull?after=${q}`, {
+        headers: { 'x-relay-time': time, 'x-relay-signature': signPull(d.keys, time, q) },
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (!res.ok) throw new Error(`relay answered ${res.status}`)
+    },
     async pull(): Promise<PullResult> {
       let handled = 0
+      let lost = 0
       try {
         for (;;) {
           const time = String(Math.floor(now() / 1000))
@@ -88,6 +100,7 @@ export function createPuller(d: PullerDeps) {
           if (!res.ok) throw new Error(`relay answered ${res.status}`)
           const { events } = (await res.json()) as { events: { id: number; sealed: string }[] }
           for (const e of events) {
+            if (e.id > after + 1) lost += e.id - after - 1
             try {
               await d.handle(JSON.parse(openSealed(d.keys, e.sealed)))
             } catch (err) {
@@ -100,10 +113,10 @@ export function createPuller(d: PullerDeps) {
           if (events.length === 0) break
         }
         failures = 0
-        return { handled, failures }
+        return { handled, failures, lost }
       } catch (err) {
         failures++
-        return { handled, failures, error: (err as Error).message }
+        return { handled, failures, lost, error: (err as Error).message }
       }
     },
   }
