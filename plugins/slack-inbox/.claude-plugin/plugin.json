@@ -1,6 +1,6 @@
 {
   "name": "agentic-utils-slack-inbox",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": "Read-only Slack listener (Socket Mode) that logs messages addressed to you as JSONL, plus a Claude Code channel that pushes them, or every message in a subscribed conversation or thread, into the session",
   "author": {
     "name": "agentic-utils"
