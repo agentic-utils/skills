@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import { unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import type { EventsApiPayload, Me, SlackMessage } from './match'
-import { createHandler, deliveryStalled, recentChannels, sleptFor, socketProblem } from './run'
+import { createHandler, deliveryStalled, drainRelay, recentChannels, sleptFor, socketProblem } from './run'
 import type { Watches } from './subs'
 
 const me: Me = { userId: 'UME', teamId: 'T1' }
@@ -177,4 +177,20 @@ test("someone else writing the attribution line does not get the via_claude flag
   await s.handle(event({ channel: 'D1', channel_type: 'im', text: 'skip this one _✨ via <https://example.invalid|Claude session>_' }))
   expect(s.out).toHaveLength(1)
   expect(s.out[0].via_claude).toBeUndefined()
+})
+
+test('the relay is not pulled until the user groups have loaded', async () => {
+  const calls: string[] = []
+  let loaded = false
+  const d = { groupsLoaded: () => loaded, loadGroups: async () => void calls.push('load'), pull: async () => void calls.push('pull') }
+  await drainRelay(d)
+  expect(calls).toEqual(['load'])
+  d.loadGroups = async () => {
+    calls.push('load')
+    loaded = true
+  }
+  await drainRelay(d)
+  expect(calls).toEqual(['load', 'load', 'pull'])
+  await drainRelay(d)
+  expect(calls).toEqual(['load', 'load', 'pull', 'pull'])
 })

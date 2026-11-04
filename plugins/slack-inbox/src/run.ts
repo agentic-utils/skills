@@ -101,6 +101,13 @@ export function recentChannels(path: string, max: number): string[] {
   return [...out]
 }
 
+// A queued mention of a user group can only be matched once the user's groups are known, and a message matched
+// without them is consumed for good. So nothing is pulled until they have loaded; the queue keeps it meanwhile.
+export async function drainRelay(d: { groupsLoaded: () => boolean; loadGroups: () => Promise<void>; pull: () => Promise<void> }) {
+  if (!d.groupsLoaded()) await d.loadGroups()
+  if (d.groupsLoaded()) await d.pull()
+}
+
 export type HandlerDeps = {
   me: Me
   teamUrl: string
@@ -206,14 +213,21 @@ export async function run(cfg: Config) {
 
   let groups = new Set<string>()
   let groupsAt = 0
+  let groupsLoaded = false
+  let groupsWaitReported = false
   const refreshGroups = async () => {
     try {
       groups = await myGroups(cfg.userToken, me.userId)
       groupsAt = Date.now()
+      groupsLoaded = true
       log(`in ${groups.size} user group(s)`)
     } catch (e) {
       log(`user group refresh failed, keeping the last list: ${(e as Error).message}`)
       groupsAt = Date.now() - cfg.groupRefreshMinutes * 60_000 + 60_000 // try again in a minute
+      if (cfg.relayUrl && !groupsLoaded && !groupsWaitReported) {
+        groupsWaitReported = true
+        status('disconnected', `not pulling from the relay until user groups load: ${(e as Error).message}`)
+      }
     }
   }
 
@@ -443,7 +457,7 @@ export async function run(cfg: Config) {
     }
     paused = false
     // connect first: right after a wake this refresh can wait out a 30 second timeout
-    if (puller) await pullRelay()
+    if (puller) await drainRelay({ groupsLoaded: () => groupsLoaded, loadGroups: refreshGroups, pull: pullRelay })
     else if (!ws && !connecting && now >= retryAt) await connect()
     if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
     await checkDelivery(now)
