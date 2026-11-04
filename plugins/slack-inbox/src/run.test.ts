@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import type { EventsApiPayload, Me, SlackMessage } from './match'
-import { createHandler } from './run'
+import { createHandler, sleptFor, socketProblem } from './run'
 import type { Watches } from './subs'
 
 const me: Me = { userId: 'UME', teamId: 'T1' }
@@ -123,4 +123,20 @@ test('the same message twice is logged once', async () => {
   await s.handle(event({}, { event_id: 'E1' }))
   await s.handle(event({}, { event_id: 'E2' }))
   expect(s.out).toHaveLength(1)
+})
+
+test('a socket that never says hello is replaced after the timeout', () => {
+  expect(socketProblem({ now: 29_000, openedAt: 0 })).toBeNull()
+  expect(socketProblem({ now: 31_000, openedAt: 0 })).toBe('no hello from slack')
+})
+
+test('a connected socket is replaced only after a minute with no frame at all', () => {
+  expect(socketProblem({ now: 59_000, openedAt: 0, helloAt: 0 })).toBeNull()
+  expect(socketProblem({ now: 61_000, openedAt: 0, helloAt: 0 })).toBe('no traffic from slack')
+  expect(socketProblem({ now: 110_000, openedAt: 0, helloAt: 0, lastFrameAt: 100_000 })).toBeNull()
+})
+
+test('sleep length reads in seconds, then minutes', () => {
+  expect(sleptFor(45_000)).toBe('45s')
+  expect(sleptFor(6_000_000)).toBe('100m')
 })

@@ -28,6 +28,17 @@ const THREAD_TTL_MS = 30 * 86_400_000 // forget a thread the user hasn't touched
 const NEGATIVE_TTL_MS = 10 * 60_000 // re-ask about a thread the user wasn't in after 10 minutes
 const TICK_MS = 15_000
 const SLEPT_MS = 30_000 // a tick this late means the machine slept, so the socket is probably dead
+const HELLO_TIMEOUT_MS = 30_000 // a socket that opens but never says hello would otherwise block reconnecting for good
+const SILENT_MS = 60_000 // Slack pings about every 10 seconds, so this much silence means the socket is dead
+
+// Why a socket should be replaced, or null. Silence includes protocol pings, so a quiet workspace never trips it.
+export function socketProblem(s: { now: number; openedAt: number; helloAt?: number; lastFrameAt?: number }): string | null {
+  if (s.helloAt === undefined) return s.now - s.openedAt > HELLO_TIMEOUT_MS ? 'no hello from slack' : null
+  return s.now - (s.lastFrameAt ?? s.helloAt) > SILENT_MS ? 'no traffic from slack' : null
+}
+
+// Whole minutes once it is worth saying, as the machine may have slept for days.
+export const sleptFor = (ms: number) => (ms < 90_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`)
 
 function writeAtomic(path: string, data: string) {
   const fd = openSync(`${path}.tmp`, 'w', 0o600)
@@ -220,6 +231,7 @@ export async function run(cfg: Config) {
 
   // --- the socket ---
   let ws: WebSocket | null = null
+  let health = { openedAt: 0, helloAt: undefined as number | undefined, lastFrameAt: undefined as number | undefined }
   let connecting = false
   let backoff = 1000
   let retryAt = 0
@@ -250,8 +262,15 @@ export async function run(cfg: Config) {
       const url = await socketUrl(cfg.appToken)
       const sock = new WebSocket(url)
       ws = sock
+      health = { openedAt: Date.now(), helloAt: undefined, lastFrameAt: undefined }
+      const heard = () => {
+        if (ws === sock) health.lastFrameAt = Date.now()
+      }
+      // Bun surfaces protocol pings as an event; the DOM type does not know about them
+      ;(sock as unknown as { addEventListener(type: string, fn: () => void): void }).addEventListener('ping', heard)
       sock.onmessage = ev => {
-        let msg: { type?: string; envelope_id?: string; reason?: string; payload?: EventsApiPayload }
+        heard()
+        let msg: { type?: string; envelope_id?: string; reason?: string; num_connections?: number; payload?: EventsApiPayload }
         try {
           msg = JSON.parse(String(ev.data))
         } catch {
@@ -261,6 +280,9 @@ export async function run(cfg: Config) {
         if (msg.envelope_id) sock.send(JSON.stringify({ envelope_id: msg.envelope_id }))
         if (msg.type === 'hello') {
           backoff = 1000
+          if (ws === sock) health.helloAt = Date.now()
+          // Slack shares events between connections, so more than one means something else holds this app's token
+          if ((msg.num_connections ?? 1) > 1) log(`warning: ${msg.num_connections} connections on this app token; events are shared between them`)
           status('connected')
         } else if (msg.type === 'disconnect') {
           // Slack is about to close this socket (refresh, warning, link_disabled); open a fresh one now
@@ -298,9 +320,16 @@ export async function run(cfg: Config) {
   let paused = false
   const tick = async () => {
     const now = Date.now()
-    const slept = now - lastTick > SLEPT_MS
+    const late = now - lastTick
+    const slept = late > SLEPT_MS
     lastTick = now
-    if (slept && ws) drop('machine slept')
+    if (slept) backoff = 1000
+    // logged on waking, so it says how long: a brief wake can report connected and freeze again seconds later
+    if (slept && ws) drop(`machine slept for ${sleptFor(late)}`)
+    if (ws) {
+      const problem = socketProblem({ now, ...health })
+      if (problem) drop(problem)
+    }
     if (!inHours(cfg.hours, new Date())) {
       if (ws) drop('outside working hours')
       if (!paused) status('paused', 'outside working hours')
@@ -309,8 +338,9 @@ export async function run(cfg: Config) {
       return
     }
     paused = false
-    if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
+    // connect first: right after a wake this refresh can wait out a 30 second timeout
     if (!ws && !connecting && now >= retryAt) await connect()
+    if (now - groupsAt > cfg.groupRefreshMinutes * 60_000) await refreshGroups()
     saveThreads()
   }
 
