@@ -348,7 +348,9 @@ export async function run(cfg: Config) {
 
   const checkDelivery = async (now: number) => {
     const connectedAt = puller ? relaySince : health.helloAt
-    if (stalled || connectedAt === undefined || now - stallCheckAt < STALL_CHECK_MS) return
+    // An unread queue looks like silence from Slack, so relay mode judges lateness as of the last full read.
+    const asOf = puller ? puller.caughtUpAt() : now
+    if (stalled || connectedAt === undefined || asOf === undefined || now - stallCheckAt < STALL_CHECK_MS) return
     stallCheckAt = now
     let newestAt = 0
     for (const channel of active.keys()) {
@@ -358,7 +360,7 @@ export async function run(cfg: Config) {
         log(`delivery check ${channel} failed: ${(e as Error).message}`) // says nothing about delivery, so not a stall
       }
     }
-    if (deliveryStalled({ now, newestAt, lastEventAt, connectedAt })) {
+    if (deliveryStalled({ now: asOf, newestAt, lastEventAt, connectedAt })) {
       stalled = true
       status('stalled', "slack has newer messages than the last event received; check the app's Enable events setting in Slack app management")
     }

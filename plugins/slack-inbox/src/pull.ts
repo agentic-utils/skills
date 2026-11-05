@@ -92,9 +92,12 @@ export function createPuller(d: PullerDeps) {
   const now = d.now ?? Date.now
   let after = readCursor(d.cursorFile)
   let failures = 0
+  let caughtUpAt: number | undefined
 
   return {
     outage: () => failures >= FAILURES_BEFORE_OUTAGE,
+    // When a pull last read to the end of the queue. Undefined during a pull and after a failed one: the queue may be behind.
+    caughtUpAt: () => caughtUpAt,
     // Proves the relay accepts this key, without reading the queue: nothing is newer than the largest possible id
     async ping(): Promise<void> {
       const time = String(Math.floor(now() / 1000))
@@ -109,6 +112,7 @@ export function createPuller(d: PullerDeps) {
       let handled = 0
       let lost = 0
       let skipped = 0
+      caughtUpAt = undefined
       try {
         for (;;) {
           const time = String(Math.floor(now() / 1000))
@@ -135,6 +139,7 @@ export function createPuller(d: PullerDeps) {
           if (events.length === 0) break
         }
         failures = 0
+        caughtUpAt = now()
         return { handled, failures, lost, skipped }
       } catch (err) {
         failures++
