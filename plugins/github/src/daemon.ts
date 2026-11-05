@@ -546,8 +546,9 @@ export async function startDaemon() {
     const head = out.split(/\r?\n\r?\n/)[0]
     const h = (name: string) => head.match(new RegExp(`^${name}:\\s*(.+?)\\s*$`, 'im'))?.[1]
     const wait = Math.max(Number(h('x-poll-interval')) || 0, Number(h('retry-after')) || 0) * 1000
+    // a request gh sent without its token gets the anonymous limit of 60: that says nothing about the user's allowance
     const left = h('x-ratelimit-remaining')
-    if (left !== undefined && Number(left) <= POLL_RESERVE) pausePolling(Number(h('x-ratelimit-reset')) * 1000)
+    if (left !== undefined && Number(h('x-ratelimit-limit')) > POLL_RESERVE && Number(left) <= POLL_RESERVE) pausePolling(Number(h('x-ratelimit-reset')) * 1000)
     const status = Number(head.match(/^HTTP\/\S+ (\d+)/)?.[1])
     if (status === 304) return { changed: false, wait, keep: () => {} }
     if (code !== 0) throw Object.assign(new Error(why), { wait })
