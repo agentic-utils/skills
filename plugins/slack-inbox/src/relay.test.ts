@@ -205,6 +205,35 @@ test('an event that fails because of the disk or Slack stays in the queue and is
   expect(readFileSync(f, 'utf8')).toBe('2')
 })
 
+test('the queue only counts as caught up after a pull reads to its end', async () => {
+  const { store } = memStore()
+  const relay = setup(store)
+  await relay(post(callback({ event_id: 'a' })))
+  let clock = NOW
+  let failure: Error | null = Object.assign(new Error('slack timed out'), { retry: true })
+  let duringPull: number | undefined = -1
+  const p = createPuller({ url: 'https://r.example', keys, cursorFile: tmp(), now: () => clock, log: () => {}, fetch: viaRelay(relay), handle: async () => {
+    duringPull = p.caughtUpAt()
+    if (failure) throw failure
+  } })
+  expect(p.caughtUpAt()).toBeUndefined()
+  await p.pull()
+  expect(p.caughtUpAt()).toBeUndefined()
+  failure = null
+  await p.pull()
+  expect(duringPull).toBeUndefined()
+  expect(p.caughtUpAt()).toBe(NOW)
+  // a later failure must not leave the earlier time standing, as the queue may be behind again
+  await relay(post(callback({ event_id: 'b' })))
+  clock = NOW + 60_000
+  failure = Object.assign(new Error('slack timed out'), { retry: true })
+  await p.pull()
+  expect(p.caughtUpAt()).toBeUndefined()
+  failure = null
+  await p.pull()
+  expect(p.caughtUpAt()).toBe(NOW + 60_000)
+})
+
 test('an event the handler can never deal with is skipped and counted, not retried for ever', async () => {
   const { store } = memStore()
   const relay = setup(store)
