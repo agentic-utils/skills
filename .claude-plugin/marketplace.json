@@ -60,7 +60,7 @@
     {
       "name": "agentic-utils-github",
       "description": "Push GitHub PR comments, reviews and CI results into the session",
-      "version": "3.3.2",
+      "version": "3.3.3",
       "source": "./plugins/github",
       "category": "development"
     },
