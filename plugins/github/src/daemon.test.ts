@@ -32,7 +32,7 @@ const fakeGh = `#!/bin/bash
 [ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
 for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
 case "$path" in */compare/*) echo ahead; exit ;; esac
-case " $* " in *" -q "*) printf 'main\\ttrue\\t%s\\n' "$FAKE_HEAD"; exit ;; esac
+case " $* " in *" -q "*) [ -n "$FAKE_GH_LOG" ] && echo "mergeability $path" >> "$FAKE_GH_LOG"; printf 'main\\ttrue\\t%s\\n' "$FAKE_HEAD"; exit ;; esac
 f="$FAKE_API/$(printf %s "\${path%%\\?*}" | tr / _)"
 page=$(printf '&%s' "\${path#*\\?}" | sed -n 's/.*&page=\\([0-9]*\\).*/\\1/p')
 [ -n "$page" ] && [ -f "$f@$page" ] && f="$f@$page"
@@ -89,6 +89,7 @@ function setup(extra: Record<string, string> = {}): Env {
   const env = {
     ...(process.env as Record<string, string>),
     GH_PR_EVENTS_STATE_DIR: dir,
+    GH_PR_EVENTS_RECHECK_SECONDS: '0', // most tests want every mergeability check at once; one tests the folding
     GH_PR_EVENTS_FORWARDER: `${root}/fwd`,
     GH_PR_EVENTS_GH: `${root}/gh`,
     FAKE_LOG: `${root}/fwd.log`,
@@ -1321,7 +1322,7 @@ for (const [why, msg] of [
     async () => {
       const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1' })
       const { s } = await polling(e, msg, 'sess-poll', 'abcdef09')
-      expect(s.got[0]).toEqual({ content: `pr-events: polling o/r#7 every 1s (forward unavailable: ${why})`, meta: { event: 'polling' } })
+      expect(s.got[0]).toEqual({ content: `pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: ${why})`, meta: { event: 'polling' } })
       serve(e, 'repos/o/r/issues/7/comments', [apiComment(950, new Date().toISOString())])
       await until('polled comment', () => hellos(s, 950))
       await Bun.sleep(2500) // more polls: nothing repeats
@@ -1433,10 +1434,65 @@ test(
     const s = stream(d, 'sess-noadmin')
     expect((await call(d, 'sess-noadmin', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
     await until('polling notice', () => s.got.length)
-    expect(s.got[0].content).toBe('pr-events: polling o/r#7 every 1s (forward unavailable: no admin on the repo)')
+    expect(s.got[0].content).toBe('pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: no admin on the repo)')
     serve(e, 'repos/o/r/issues/7/comments', [apiComment(980, new Date().toISOString())])
     await until('polled comment', () => hellos(s, 980))
     expect(forwarders(e).size).toBe(0) // never even tried
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a polled PR whose CI alone changed fetches only its CI, not the whole catch-up',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr1"')
+    writeFileSync(`${e.api}/repos_o_r_commits_abcdef16_check-suites.etag`, '"ci1"')
+    const { s } = await polling(e, NO_ADMIN, 'sess-ci', 'abcdef16')
+    const ghLog = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '')
+    const count = (re: RegExp) => ghLog().match(re)?.length ?? 0
+    await until('a conditional CI probe', () => count(/inm="ci1"/g))
+    const comments = count(/call repos\/o\/r\/issues\/7\/comments/g)
+    // a comment the PR probe doesn't show (its ETag is unchanged), and a finished check suite the CI probe does
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(990, new Date().toISOString())])
+    const suite = { id: 55, status: 'completed', conclusion: 'failure', app: { slug: 'ci', name: 'Some CI' }, head_sha: 'abcdef16', updated_at: new Date().toISOString() }
+    serve(e, 'repos/o/r/commits/abcdef16/check-suites', { check_suites: [suite] })
+    writeFileSync(`${e.api}/repos_o_r_commits_abcdef16_check-suites.etag`, '"ci2"')
+    await until('the CI event', () => s.got.some(g => g.content.startsWith('o/r#7: Checks failure (Some CI) on abcdef1')))
+    await until('two more CI probes', () => count(/inm="ci2"/g) >= 2)
+    expect(count(/call repos\/o\/r\/issues\/7\/comments/g)).toBe(comments) // no full catch-up
+    expect(hellos(s, 990)).toBe(0)
+    expect(s.got.filter(g => g.content.includes('Checks failure')).length).toBe(1) // later CI-only polls don't repeat it
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'mergeability is checked for pushes to the PR base only, and pushes close together are folded into one check',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_RECHECK_SECONDS: '3', FAKE_GH_LOG: '', FAKE_HEAD: 'abcdef17' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    const checks = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '').match(/^mergeability repos\/o\/r\/pulls\/7$/gm)?.length ?? 0
+    const d = await daemon(e)
+    const s = stream(d, 'sess-merge')
+    expect((await call(d, 'sess-merge', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
+    const [[, args]] = await up(e)
+    await until('the check on subscribing', () => checks() === 1)
+    const push = (branch: string) => hook(d, secretOf(args), 'push', { ref: `refs/heads/${branch}`, repository: { full_name: 'o/r' } })
+    await Bun.sleep(3000) // past the window the subscribe check opened
+    for (let i = 0; i < 3; i++) await push('someone-elses-branch')
+    await Bun.sleep(500)
+    expect(checks()).toBe(1) // not the PR's base: nothing to check
+    for (let i = 0; i < 3; i++) await push('main')
+    await until('the first base push checked at once', () => checks() === 2)
+    await Bun.sleep(1000)
+    expect(checks()).toBe(2) // the other two wait for the window
+    await until('one folded check for both', () => checks() === 3)
+    await Bun.sleep(3500)
+    expect(checks()).toBe(3)
     await s.close()
   },
   T,
