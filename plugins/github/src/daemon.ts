@@ -26,8 +26,16 @@ const RETRY_MS = Number(process.env.GH_PR_EVENTS_RETRY_MS ?? 30_000) // between 
 const API_TIMEOUT_MS = 60_000
 const RECOVERED = '(recovered after a gap) '
 const REOPEN_HOURS = Number(process.env.GH_PR_EVENTS_REOPEN_HOURS ?? 24) // keep a closed, unmerged PR this long in case it's reopened
-// a repo we can't forward is probed this often: an unchanged PR answers 304, which costs no rate limit
-const POLL_MS = Number(process.env.GH_PR_EVENTS_POLL_SECONDS ?? 15) * 1000
+// a repo we can't forward is probed this often (give or take a fifth, so polls don't bunch): an unchanged PR answers
+// 304, which costs no rate limit, but a changed one costs a catch-up
+const POLL_MS = Number(process.env.GH_PR_EVENTS_POLL_SECONDS ?? 60) * 1000
+// once none of a polled repo's PRs has changed for IDLE_AFTER_MS, it's probed this often instead
+const IDLE_POLL_MS = Math.max(POLL_MS, Number(process.env.GH_PR_EVENTS_IDLE_POLL_SECONDS ?? 300) * 1000)
+const IDLE_AFTER_MS = 30 * 60_000
+const jitter = (ms: number) => Math.round(ms * (0.8 + Math.random() * 0.4))
+// a PR's mergeability is asked at most this often; asks in between are folded into the next one
+const RECHECK_MS = Number(process.env.GH_PR_EVENTS_RECHECK_SECONDS ?? 60) * 1000
+const LEDGER_MS = 60 * 60_000 // the daemon's own calls are counted over this window, to say who spent the allowance
 // its forward is first retried after this long, then twice as long each time up to an hour (env: tests only)
 const FORWARD_RETRY_MS = Number(process.env.GH_PR_EVENTS_FORWARD_RETRY_MS ?? 5 * 60_000)
 const FORWARD_RETRY_MAX_MS = Math.max(FORWARD_RETRY_MS, 60 * 60_000)
@@ -53,7 +61,9 @@ type Session = {
   ephemeral?: boolean
   streams: Set<(e: Ev) => boolean>
 }
-type Sub = { pr: string; sessions: Set<string>; conflictBase?: string } // conflictBase: set while the PR conflicts with it
+// conflictBase: set while the PR conflicts with it. base: its base branch, once known, so pushes elsewhere are skipped.
+// changed: when a poll last saw it change (or it was subscribed), for slowing polls of quiet PRs.
+type Sub = { pr: string; sessions: Set<string>; conflictBase?: string; base?: string; changed?: number }
 // A repo's forwarder from the first subscribe on: `ready` settles once it has started (null) or failed (the error).
 // refused: why GitHub refused the forward, if it did.
 type Fwd = { p?: Subprocess<'ignore', 'ignore', 'pipe'>; ready: Promise<string | null>; up: boolean; cancelled: boolean; refused?: string }
@@ -72,6 +82,8 @@ type Done = { id: string; t: number; r?: true }
 // merged: when it merged (it's watched for late comments until GRACE_MS after).
 type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number; merged?: number }
 
+// owner/repo of an API path such as repos/o/r/pulls/7?x=1
+const repoOf = (path: string) => path.split('?')[0].split('/').slice(1, 3).join('/').toLowerCase()
 const actionOf = (p: any) => `pr${p.action}${p.label?.name ?? p.requested_reviewer?.login ?? p.requested_team?.name ?? ''}`
 // An event's identity, the same whether it came live or from the API, so a catch-up never repeats one.
 function idOf(event: string, p: any): string | undefined {
@@ -130,6 +142,16 @@ export async function startDaemon() {
   const etags = new Map<string, string>() // API path -> its last ETag, for conditional polls
   let pollPause = 0 // no polling before this: the allowance is nearly used
   const pollFails = new Map<string, number>() // key -> failed polls in a row
+  // mergeability checks: when each PR was last asked, and the asks folded into a later one (onlyBase undefined: any base)
+  const rechecked = new Map<string, number>()
+  const recheckDue = new Map<string, { onlyBase?: string }>()
+  // every API call the daemon made in the last LEDGER_MS (304s excluded: they're free), by what it was for
+  const ledger: { t: number; what: string }[] = []
+  const spent = (what: string) => {
+    const now = Date.now()
+    ledger.push({ t: now, what })
+    while (ledger.length && ledger[0].t < now - LEDGER_MS) ledger.shift()
+  }
   const waits = new Set<Timer>() // pending restarts and catch-up retries, cleared by stop()
   const later = (fn: () => unknown, ms: number) => {
     const t = setTimeout(() => (waits.delete(t), halting || fn()), ms)
@@ -398,7 +420,8 @@ export async function startDaemon() {
     polled.set(repo, { due: Date.now(), retry: Date.now() + backoff, backoff, swept: 0, why })
     for (const k of inRepo(repo)) tell(k, pollingMsg(subs.get(k)!.pr, why))
   }
-  const pollingMsg = (pr: string, why: string) => `pr-events: polling ${pr} every ${POLL_MS / 1000}s (forward unavailable: ${why})`
+  const pollingMsg = (pr: string, why: string) =>
+    `pr-events: polling ${pr} every ${POLL_MS / 1000}s, every ${IDLE_POLL_MS / 1000}s once quiet for ${IDLE_AFTER_MS / 60_000} min (forward unavailable: ${why})`
   const tell = (key: string, content: string) => {
     for (const id of subs.get(key)?.sessions ?? []) deliver(id, { content, meta: { event: 'polling' } })
   }
@@ -451,6 +474,8 @@ export async function startDaemon() {
   // ---- merge conflicts and force pushes, which webhooks don't report directly ----
 
   const gh = async (...args: string[]) => {
+    const path = args.find(a => a.startsWith('repos/'))
+    if (path) spent(repoOf(path))
     try {
       const p = Bun.spawn([process.env.GH_PR_EVENTS_GH ?? 'gh', ...args], { stdout: 'pipe', stderr: 'ignore' })
       return (await new Response(p.stdout).text()).trim()
@@ -484,10 +509,34 @@ export async function startDaemon() {
     const s = subs.get(key)
     const c = seen.get(key)
     if (c && r?.head) c.head ??= r.head // where a catch-up spots pushes from
+    if (s && r?.base) s.base = r.base
     if (!r || !s || (onlyBase && r.base !== onlyBase) || r.conflicted === !!s.conflictBase) return
     s.conflictBase = r.conflicted ? r.base : undefined
     const e = conflictEv(s, r.base, r.conflicted)
     emitTo(key, e.content, e.meta)
+  }
+  // Every reason to recheck a PR comes through here: a push to a branch other than its known base is skipped, and
+  // asks within RECHECK_MS of the last check are folded into one check when that time is up (each check can cost up
+  // to 5 calls, and a busy repo's base and branches move many times a minute).
+  function askRecheck(key: string, onlyBase?: string) {
+    const s = subs.get(key)
+    if (!s || (onlyBase !== undefined && s.base !== undefined && s.base !== onlyBase)) return
+    const due = recheckDue.get(key)
+    if (due) {
+      if (due.onlyBase !== onlyBase) due.onlyBase = undefined // two different reasons: check whatever the base is
+      return
+    }
+    recheckDue.set(key, { onlyBase })
+    const run = () => {
+      const d = recheckDue.get(key)
+      if (!d) return // unsubscribed meanwhile
+      recheckDue.delete(key)
+      rechecked.set(key, Date.now())
+      recheck(key, d.onlyBase).catch(log)
+    }
+    const wait = (rechecked.get(key) ?? -Infinity) + RECHECK_MS - Date.now()
+    if (wait > 0) later(run, wait)
+    else run()
   }
   // A force push arrives as an ordinary synchronize; the old head not being an ancestor of the new one gives it away.
   // ponytail: compare failing (e.g. old head gone) reads as a normal push
@@ -502,6 +551,7 @@ export async function startDaemon() {
     if (ghOld) throw new Error(ghOld)
     const p = Bun.spawn([process.env.GH_PR_EVENTS_GH ?? 'gh', 'api', ...args, path], { stdout: 'pipe', stderr: 'pipe', timeout: API_TIMEOUT_MS })
     const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited])
+    if (!/^HTTP\/\S+ 304/.test(out)) spent(repoOf(path))
     if (p.signalCode) throw new Error(`gh api ${path} timed out`)
     return { out, code, why: `gh api ${path} failed: ${err.trim().split('\n')[0] || `exit ${code}`}` }
   }
@@ -524,16 +574,28 @@ export async function startDaemon() {
     }
   }
 
+  // What the daemon spent in the last hour against what GitHub counted, e.g. "pr-events made 1200 of the 4500 calls
+  // counted (two-inc/infra 900, two-inc/risk-engine 300); the other 3300 came from other gh use on this account".
+  function spending(used?: number): string {
+    const by = new Map<string, number>()
+    for (const { what } of ledger) by.set(what, (by.get(what) ?? 0) + 1)
+    const top = [...by].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([w, n]) => `${w} ${n}`).join(', ')
+    const ours = `pr-events made ${ledger.length} calls in the last hour${top ? ` (${top})` : ''}`
+    // GitHub's window is the hour to the reset, ours the hour to now: near enough to say who's spending
+    return used !== undefined && used >= ledger.length ? `${ours}; GitHub counted ${used}, so about ${used - ledger.length} came from other gh use on this account` : ours
+  }
   // Stops every poll until the allowance resets; its sessions are told once, as silence would look like a quiet PR.
-  function pausePolling(until: number) {
+  function pausePolling(until: number, used?: number) {
     if (!(until > Date.now()) || until <= pollPause) return
     const pausing = pollPause <= Date.now()
     pollPause = until
     if (!pausing) return
     const at = new Date(until).toISOString()
-    log(`GitHub allowance low: polling paused until ${at}`)
+    const who = spending(used)
+    log(`GitHub allowance low: polling paused until ${at}; ${who}`)
     for (const repo of polled.keys())
-      for (const k of inRepo(repo)) emitTo(k, `pr-events: polling ${subs.get(k)!.pr} paused until ${at}, GitHub allowance nearly used; it resumes by itself`, { event: 'polling' })
+      for (const k of inRepo(repo))
+        emitTo(k, `pr-events: polling ${subs.get(k)!.pr} paused until ${at}, GitHub allowance nearly used (${who}); it resumes by itself`, { event: 'polling' })
   }
 
   // Whether the resource changed since the last call, by a conditional GET: GitHub answers an unchanged one with a 304,
@@ -548,7 +610,8 @@ export async function startDaemon() {
     const wait = Math.max(Number(h('x-poll-interval')) || 0, Number(h('retry-after')) || 0) * 1000
     // a request gh sent without its token gets the anonymous limit of 60: that says nothing about the user's allowance
     const left = h('x-ratelimit-remaining')
-    if (left !== undefined && Number(h('x-ratelimit-limit')) > POLL_RESERVE && Number(left) <= POLL_RESERVE) pausePolling(Number(h('x-ratelimit-reset')) * 1000)
+    const limit = Number(h('x-ratelimit-limit'))
+    if (left !== undefined && limit > POLL_RESERVE && Number(left) <= POLL_RESERVE) pausePolling(Number(h('x-ratelimit-reset')) * 1000, limit - Number(left))
     const status = Number(head.match(/^HTTP\/\S+ (\d+)/)?.[1])
     if (status === 304) return { changed: false, wait, keep: () => {} }
     if (code !== 0) throw Object.assign(new Error(why), { wait })
@@ -565,7 +628,11 @@ export async function startDaemon() {
     const [repo, n] = sub.pr.split('#')
     try {
       const probes = await Promise.all([`repos/${repo}/pulls/${n}`, ...(c.head ? [`repos/${repo}/commits/${c.head}/check-suites`] : [])].map(changed))
-      if (sweep || c.gap !== undefined || probes.some(p => p.changed)) await catchUp(key, 0, true)
+      const [pr, ci] = probes
+      // a new comment, review, label or push changes the PR itself, so CI alone changing needs only the CI
+      if (sweep || c.gap !== undefined || pr.changed) await catchUp(key, 0, true)
+      else if (ci?.changed) await ciCatchUp(key)
+      if (probes.some(p => p.changed)) sub.changed = Date.now()
       probes.forEach(p => p.keep())
       pollFails.delete(key)
       return Math.max(0, ...probes.map(p => p.wait))
@@ -593,7 +660,10 @@ export async function startDaemon() {
       if (sweep) p.swept = now
       Promise.all(inRepo(repo).map(k => pollPr(k, sweep))).then(w => {
         p.busy = false
-        p.due = Date.now() + Math.max(POLL_MS, ...w)
+        // a repo whose PRs have all been quiet for a while is probed less often; any change speeds it up again
+        const lastChange = Math.max(0, ...inRepo(repo).map(k => subs.get(k)?.changed ?? 0))
+        const every = Date.now() - lastChange > IDLE_AFTER_MS ? IDLE_POLL_MS : POLL_MS
+        p.due = Date.now() + Math.max(jitter(every), ...w)
       })
     }
   }
@@ -695,12 +765,7 @@ export async function startDaemon() {
             event: 'pull_request_review',
             payload: { action: 'submitted', repository, sender: r.user, pull_request: { number: pr }, review: { ...r, state: String(r.state).toLowerCase() } },
           })
-      for (const w of runs)
-        if (w.status === 'completed' && fresh(w.updated_at))
-          missed.push({ t: w.updated_at, event: 'workflow_run', payload: { action: 'completed', repository, workflow_run: { ...w, pull_requests: [{ number: pr }] } } })
-      for (const s of ci.flatMap(x => x.suites))
-        if (s.status === 'completed' && fresh(s.updated_at))
-          missed.push({ t: s.updated_at, event: 'check_suite', payload: { action: 'completed', repository, check_suite: { ...s, pull_requests: [{ number: pr }] } } })
+      missed.push(...ciMissed(repo, pr, runs, ci.flatMap(x => x.suites), fresh))
       // new commits, from the head commit's author at its commit time
       if (c.head && c.head !== sha) {
         const commit = await api(`repos/${repo}/commits/${sha}`)
@@ -729,7 +794,7 @@ export async function startDaemon() {
       prune(c)
       if (missed.length) log(`caught up ${sub.pr} from ${new Date(from).toISOString()}`)
       save()
-      recheck(key).catch(log) // the base may have moved meanwhile
+      askRecheck(key) // the base may have moved meanwhile
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e)
       log(`catch-up for ${sub.pr} failed (${why})`)
@@ -738,6 +803,46 @@ export async function startDaemon() {
       // the gap stays open, so the next sleep or restart tries again
       emitTo(key, `pr-events could not recover the events missed since ${new Date(from).toISOString()}: ${why}`, { event: 'channel_error' }) // led by the PR's name
     }
+  }
+
+  // Finished workflow runs and check suites as the webhooks they'd have been.
+  type Missed = { t: string; event: string; payload: any }
+  function ciMissed(repo: string, pr: number, runs: any[], suites: any[], fresh: (t?: string | null) => boolean): Missed[] {
+    const repository = { full_name: repo }
+    const out: Missed[] = []
+    for (const w of runs)
+      if (w.status === 'completed' && fresh(w.updated_at))
+        out.push({ t: w.updated_at, event: 'workflow_run', payload: { action: 'completed', repository, workflow_run: { ...w, pull_requests: [{ number: pr }] } } })
+    for (const s of suites)
+      if (s.status === 'completed' && fresh(s.updated_at))
+        out.push({ t: s.updated_at, event: 'check_suite', payload: { action: 'completed', repository, check_suite: { ...s, pull_requests: [{ number: pr }] } } })
+    return out
+  }
+
+  // A polled PR whose head's CI changed and nothing else did: just that head's runs and suites (2 calls), not a
+  // whole catch-up (8 or more). It doesn't move `since`, so the next full catch-up still covers the same window; ids
+  // keep anything from repeating.
+  async function ciCatchUp(key: string): Promise<void> {
+    const c = seen.get(key)
+    const sub = subs.get(key)
+    if (!c?.head || !sub) return
+    const head = c.head
+    const [repo, n] = sub.pr.split('#')
+    const after = Math.max((c.gap ?? c.since) - SLACK_MS, c.at)
+    const fresh = (t?: string | null) => !!t && Date.parse(t) > after
+    const [runs, suites] = await Promise.all([
+      api(`repos/${repo}/actions/runs?per_page=100&head_sha=${head}`, 'list'),
+      api(`repos/${repo}/commits/${head}/check-suites?per_page=100`, 'list'),
+    ])
+    const missed = ciMissed(
+      repo,
+      Number(n),
+      runs.flatMap((p: any) => p.workflow_runs ?? []),
+      suites.flatMap((p: any) => p.check_suites ?? []),
+      fresh,
+    ).sort((a, b) => a.t.localeCompare(b.t))
+    for (const m of missed) await handle(m.event, m.payload, Date.parse(m.t) || Date.now(), true)
+    if (missed.length) save()
   }
 
   // Forgets delivered events too old for any catch-up window to reach again.
@@ -754,9 +859,9 @@ export async function startDaemon() {
     const s = session(id)
     let sub = subs.get(key)
     if (!sub) {
-      subs.set(key, (sub = { pr, sessions: new Set() }))
+      subs.set(key, (sub = { pr, sessions: new Set(), changed: Date.now() }))
       if (!seen.has(key)) seen.set(key, { since: Date.now(), at: Date.now(), done: [] }) // a restored one keeps its own
-      recheck(key).catch(log) // reports a PR that already has conflicts
+      askRecheck(key) // reports a PR that already has conflicts
     }
     sub.sessions.add(id)
     s.subs.set(key, pr)
@@ -784,6 +889,8 @@ export async function startDaemon() {
     subs.delete(key)
     seen.delete(key)
     pollFails.delete(key)
+    rechecked.delete(key)
+    recheckDue.delete(key)
     const repo = key.split('#')[0]
     if (!inRepo(repo).length) (stopForwarder(repo), polled.delete(repo))
     armIdle()
@@ -887,9 +994,11 @@ export async function startDaemon() {
     const key = `${repo}#${e?.pr}`.toLowerCase()
     if (event === 'push' && payload.ref?.startsWith('refs/heads/')) {
       const branch = payload.ref.slice('refs/heads/'.length)
-      for (const k of inRepo(repo.toLowerCase())) recheck(k, branch).catch(log)
+      for (const k of inRepo(repo.toLowerCase())) askRecheck(k, branch)
     }
-    if (event === 'pull_request' && payload.action === 'synchronize' && subs.has(key) && !recovered) recheck(key).catch(log)
+    const base = payload.pull_request?.base?.ref
+    if (typeof base === 'string' && subs.has(key)) subs.get(key)!.base = base
+    if (event === 'pull_request' && payload.action === 'synchronize' && subs.has(key) && !recovered) askRecheck(key)
     const c = seen.get(key)
     if (c && event === 'pull_request' && payload.action === 'reopened') c.closed = undefined
     if (c && !recovered) {
@@ -1191,6 +1300,7 @@ export async function startDaemon() {
     setInterval(() => !owned() && quit('daemon.json names another daemon'), 5000),
     setInterval(() => (sleepCheck(), closedCheck()), TICK_MS),
     setInterval(pollCheck, Math.min(TICK_MS, POLL_MS)),
+    setInterval(() => ledger.length && log(`${new Date().toISOString()} ${spending()}`), 15 * 60_000),
   ]
   log(`daemon ${process.pid} ${version} on ${url}`)
   // catching up pages with `gh api --slurp`, which gh 2.48 added
