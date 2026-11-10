@@ -1377,6 +1377,7 @@ test(
     rmSync(e.env.FAKE_REFUSE)
     const c961 = apiComment(961, new Date().toISOString())
     serve(e, 'repos/o/r/issues/7/comments', [c960, c961])
+    touchPr(e, 'abcdef10')
     const [[, args]] = await up(e)
     await until('live again', () => s.got.some(g => g.content === 'pr-events: forwarding o/r#7 live again'))
     await until('caught up', () => hellos(s, 961))
