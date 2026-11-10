@@ -140,6 +140,8 @@ export async function startDaemon() {
   const polled = new Map<string, Poll>() // repos GitHub won't forward to us, polled instead
   // ponytail: never pruned (a few short strings per PR head polled); prune with the PR if polling gets heavy use
   const etags = new Map<string, string>() // API path -> its last ETag, for conditional polls
+  // API path -> what of its last body counts as a change (see prDigest), for responses whose ETag changes without one
+  const digests = new Map<string, string>()
   let pollPause = 0 // no polling before this: the allowance is nearly used
   const pollFails = new Map<string, number>() // key -> failed polls in a row
   // mergeability checks: when each PR was last asked, and the asks folded into a later one (onlyBase undefined: any base)
@@ -301,34 +303,40 @@ export async function startDaemon() {
         f.refused = 'no admin on the repo'
         return `gh webhook forward failed for ${repo}: no admin on the repo`
       }
-      if (f.cancelled) return cancelledMsg
-      const p = (f.p = Bun.spawn([bin, 'forward', `--repo=${repo}`, `--events=${events}`, `--url=${url}webhook`, `--secret=${secret}`], {
-        stdout: 'ignore',
-        stderr: 'pipe',
-      }))
-      track(p.pid, p.exited)
-      // read stderr for as long as it runs: a full, unread pipe would block the forwarder
-      let firstLine = ''
-      let all = ''
-      const stderrDone = (async () => {
-        const dec = new TextDecoder()
-        for await (const chunk of p.stderr) {
-          const text = dec.decode(chunk, { stream: true })
-          firstLine ||= text.split('\n')[0]
-          all += text
-          log(`[${repo}]`, text.trimEnd())
-        }
-      })().catch(() => {})
-      if ((await Promise.race([p.exited, Bun.sleep(3000).then(() => null)])) !== null) {
+      let p!: Subprocess<'ignore', 'ignore', 'pipe'>
+      for (let attempt = 0; ; attempt++) {
+        if (f.cancelled) return cancelledMsg
+        p = f.p = Bun.spawn([bin, 'forward', `--repo=${repo}`, `--events=${events}`, `--url=${url}webhook`, `--secret=${secret}`], {
+          stdout: 'ignore',
+          stderr: 'pipe',
+        })
+        track(p.pid, p.exited)
+        // read stderr for as long as it runs: a full, unread pipe would block the forwarder
+        let firstLine = ''
+        let all = ''
+        const stderr = p.stderr
+        const stderrDone = (async () => {
+          const dec = new TextDecoder()
+          for await (const chunk of stderr) {
+            const text = dec.decode(chunk, { stream: true })
+            firstLine ||= text.split('\n')[0]
+            all += text
+            log(`[${repo}]`, text.trimEnd())
+          }
+        })().catch(() => {})
+        if ((await Promise.race([p.exited, Bun.sleep(3000).then(() => null)])) === null) break
         if (f.cancelled) return cancelledMsg // stopped on purpose during its start
         await stderrDone
+        // a forward that lost its connection can leave its webhook behind, and GitHub refuses the next one while it's
+        // there: clear dead ones away once and try again
+        if (TAKEN.test(all) && attempt === 0 && (await clearDeadHooks(repo))) continue
         f.refused = TAKEN.test(all) ? 'another forward holds the repo' : NO_ADMIN.test(all) ? 'no admin on the repo' : undefined
         return `gh webhook forward failed for ${repo}: ${firstLine}`
       }
       f.up = true
       const upAt = Date.now()
       log(`forwarding ${repo} -> ${url}webhook`)
-      // gh-webhook exits on any lost connection (a sleep, a network change), and GitHub deletes its webhook
+      // gh-webhook exits on any lost connection (a sleep, a network change), and GitHub usually deletes its webhook
       p.exited.then(code =>
         serial(() => {
           if (forwarders.get(repo) !== f) return // stopped on purpose
@@ -564,6 +572,26 @@ export async function startDaemon() {
     return { headers: out.slice(0, i), body: JSON.parse(out.slice(i).trim()) }
   }
 
+  // Deletes the repo's gh-webhook hooks that can't be anyone's live forward: switched off, or whose last delivery the
+  // forwarding service couldn't hand to anyone (a live forward answers 200). Returns how many went; 0 on any failure.
+  async function clearDeadHooks(repo: string): Promise<number> {
+    try {
+      const hooks: any[] = await api(`repos/${repo}/hooks?per_page=100`, 'list')
+      const dead = hooks.filter(
+        h => h.name === 'cli' && /^https:\/\/webhook-forwarder\.github\.com\//.test(h.config?.url ?? '') && (!h.active || (h.last_response?.code ?? 200) !== 200),
+      )
+      for (const h of dead) {
+        const { code, why } = await ghApi(['-X', 'DELETE'], `repos/${repo}/hooks/${h.id}`)
+        if (code !== 0) throw new Error(why)
+      }
+      if (dead.length) log(`deleted ${dead.length} dead gh-webhook hook(s) on ${repo}: ${dead.map(h => h.id).join(', ')}`)
+      return dead.length
+    } catch (e) {
+      log(`couldn't clear dead hooks on ${repo} (${e instanceof Error ? e.message : e})`)
+      return 0
+    }
+  }
+
   // Whether we're admin on the repo, from its permissions; undefined if GitHub didn't say.
   async function isAdmin(repo: string): Promise<boolean | undefined> {
     try {
@@ -602,7 +630,9 @@ export async function startDaemon() {
   // which doesn't count against the rate limit (gh exits 1 on it, headers still printed). wait: how long GitHub asks
   // us to hold off (X-Poll-Interval, or Retry-After on a refusal), in ms.
   // The new ETag is only kept once the caller has caught up (keep()), so a failed catch-up is retried next poll.
-  async function changed(path: string): Promise<{ changed: boolean; wait: number; keep: () => void }> {
+  // digest: what of a 200's body counts as a change; the same digest as last time reads as unchanged (body: the parsed
+  // response, for the caller to look at).
+  async function changed(path: string, digest?: (body: any) => string): Promise<{ changed: boolean; wait: number; keep: () => void; body?: any }> {
     const etag = etags.get(path)
     const { out, code, why } = await ghApi(['-i', ...(etag ? ['-H', `If-None-Match: ${etag}`] : [])], path)
     const head = out.split(/\r?\n\r?\n/)[0]
@@ -616,8 +646,31 @@ export async function startDaemon() {
     if (status === 304) return { changed: false, wait, keep: () => {} }
     if (code !== 0) throw Object.assign(new Error(why), { wait })
     const e = h('etag')
-    return { changed: true, wait, keep: () => e && etags.set(path, e) }
+    const keepEtag = () => e && etags.set(path, e)
+    if (!digest) return { changed: true, wait, keep: keepEtag }
+    const body = JSON.parse(out.slice(head.length).trim())
+    const d = digest(body)
+    if (digests.get(path) === d) return { changed: false, wait, keep: keepEtag, body }
+    return { changed: true, wait, keep: () => (keepEtag(), digests.set(path, d)), body }
   }
+  // A PR's own state. Its API response also embeds both repos, whose pushed_at and open_issues_count move with every
+  // push or PR anywhere in the repo, so on a busy repo its ETag changes on almost every poll though the PR didn't.
+  // A comment, review, label or push to the PR all bump updated_at. Mergeability is left out: a base push resets it
+  // to null on every PR, and pollPr asks for a mergeability check when it settles on something new instead.
+  const prDigest = (b: any) =>
+    JSON.stringify([
+      b.updated_at,
+      b.state,
+      b.draft,
+      b.merged_at,
+      b.head?.sha,
+      b.base?.ref,
+      b.auto_merge ? 1 : 0,
+      (b.labels ?? []).map((l: any) => l.name),
+      (b.requested_reviewers ?? []).map((u: any) => u.login),
+      (b.requested_teams ?? []).map((t: any) => t.slug),
+    ])
+  const mergeableSeen = new Map<string, boolean>() // key -> the last settled mergeable a poll saw
 
   // One poll of a PR in a polled repo: probes the PR and its head's CI conditionally, and catches up only if either
   // changed (or a full sweep is due, or a gap is open). Returns how long GitHub asked us to wait.
@@ -627,8 +680,16 @@ export async function startDaemon() {
     if (!c || !sub) return 0
     const [repo, n] = sub.pr.split('#')
     try {
-      const probes = await Promise.all([`repos/${repo}/pulls/${n}`, ...(c.head ? [`repos/${repo}/commits/${c.head}/check-suites`] : [])].map(changed))
+      const probes = await Promise.all([
+        changed(`repos/${repo}/pulls/${n}`, prDigest),
+        ...(c.head ? [changed(`repos/${repo}/commits/${c.head}/check-suites`)] : []),
+      ])
       const [pr, ci] = probes
+      const mergeable = pr.body?.mergeable
+      if (typeof mergeable === 'boolean') {
+        if (mergeableSeen.has(key) && mergeableSeen.get(key) !== mergeable && !pr.changed) askRecheck(key) // a catch-up asks anyway
+        mergeableSeen.set(key, mergeable)
+      }
       // a new comment, review, label or push changes the PR itself, so CI alone changing needs only the CI
       if (sweep || c.gap !== undefined || pr.changed) await catchUp(key, 0, true)
       else if (ci?.changed) await ciCatchUp(key)

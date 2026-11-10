@@ -28,9 +28,11 @@ wait $c
 // seconds; with FAKE_GH_LOG set, each served call logs "call <path> inm=<If-None-Match>" and "done <path>" there.
 // <file>.etag is its ETag: -i sends it, and a matching If-None-Match gets a 304 (gh exits 1 on it, like the real one).
 // <file>.limit is "<calls left> <reset, epoch seconds> <limit>": -i sends them as the rate limit headers.
+// -X DELETE logs "delete <path>" to $FAKE_LOG and removes $FAKE_REFUSE, as deleting the hook in the way would.
 const fakeGh = `#!/bin/bash
 [ "$1" = --version ] && { echo "gh version \${FAKE_GH_VERSION:-2.96.0} (2026-07-02)"; exit; }
 for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+case " $* " in *" -X DELETE "*) echo "delete $path" >> "$FAKE_LOG"; [ -n "$FAKE_REFUSE" ] && rm -f "$FAKE_REFUSE"; exit ;; esac
 case "$path" in */compare/*) echo ahead; exit ;; esac
 case " $* " in *" -q "*) [ -n "$FAKE_GH_LOG" ] && echo "mergeability $path" >> "$FAKE_GH_LOG"; printf 'main\\ttrue\\t%s\\n' "$FAKE_HEAD"; exit ;; esac
 f="$FAKE_API/$(printf %s "\${path%%\\?*}" | tr / _)"
@@ -1312,6 +1314,8 @@ async function polling(e: Env, msg: string, sid: string, sha: string) {
   return { d, s }
 }
 const hellos = (s: { got: { content: string }[] }, id: number) => s.got.filter(g => g.content.endsWith(`hello ${id}`)).length
+// A comment, review, label or push bumps the PR's updated_at on GitHub, which is what a poll looks for
+const touchPr = (e: Env, sha: string) => serve(e, 'repos/o/r/pulls/7', { html_url: 'https://github.com/o/r/pull/7', head: { sha }, updated_at: new Date().toISOString() })
 
 for (const [why, msg] of [
   ['another forward holds the repo', TAKEN],
@@ -1324,6 +1328,7 @@ for (const [why, msg] of [
       const { s } = await polling(e, msg, 'sess-poll', 'abcdef09')
       expect(s.got[0]).toEqual({ content: `pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: ${why})`, meta: { event: 'polling' } })
       serve(e, 'repos/o/r/issues/7/comments', [apiComment(950, new Date().toISOString())])
+      touchPr(e, 'abcdef09')
       await until('polled comment', () => hellos(s, 950))
       await Bun.sleep(2500) // more polls: nothing repeats
       expect(s.got.map(g => g.content.split('\n')[0])).toEqual([s.got[0].content, 'o/r#7: Comment by amy'])
@@ -1334,12 +1339,40 @@ for (const [why, msg] of [
   )
 
 test(
+  'a forward refused by a dead gh-webhook hook deletes the dead hooks, keeps live ones, and forwards',
+  async () => {
+    const e = setup()
+    e.env.FAKE_REFUSE = `${e.api}/../refuse`
+    writeFileSync(e.env.FAKE_REFUSE, TAKEN)
+    const fwd = 'https://webhook-forwarder.github.com/hook'
+    serve(e, 'repos/o/r/hooks', [
+      { id: 1, name: 'cli', active: true, config: { url: fwd }, last_response: { code: 404 } }, // its forward is gone
+      { id: 2, name: 'cli', active: false, config: { url: fwd }, last_response: { code: null } }, // switched off
+      { id: 3, name: 'cli', active: true, config: { url: fwd }, last_response: { code: 200 } }, // someone's live forward
+      { id: 4, name: 'cli', active: true, config: { url: fwd }, last_response: { code: null } }, // live, nothing delivered yet
+      { id: 5, name: 'web', active: true, config: { url: 'https://ci.example.com/hook' }, last_response: { code: 500 } }, // not ours
+    ])
+    quietPr(e, 'abcdef19')
+    const d = await daemon(e)
+    const s = stream(d, 'sess-heal')
+    expect((await call(d, 'sess-heal', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
+    await up(e)
+    const deleted = readFileSync(e.env.FAKE_LOG, 'utf8').match(/^delete \S+$/gm)
+    expect(deleted).toEqual(['delete repos/o/r/hooks/1', 'delete repos/o/r/hooks/2'])
+    expect(s.got.filter(g => g.meta.event === 'polling')).toEqual([])
+    await s.close()
+  },
+  T,
+)
+
+test(
   'a polled repo switches back to forwarding once the forward is free, without repeats',
   async () => {
     const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', GH_PR_EVENTS_FORWARD_RETRY_MS: '3000' })
     const { d, s } = await polling(e, TAKEN, 'sess-switch', 'abcdef10')
     const c960 = apiComment(960, new Date().toISOString())
     serve(e, 'repos/o/r/issues/7/comments', [c960])
+    touchPr(e, 'abcdef10')
     await until('polled comment', () => hellos(s, 960))
     rmSync(e.env.FAKE_REFUSE)
     const c961 = apiComment(961, new Date().toISOString())
@@ -1376,7 +1409,35 @@ test(
     expect(count(/call repos\/o\/r\/issues\/7\/comments/g)).toBe(fetched) // no catch-up behind a 304
     expect(hellos(s, 970)).toBe(0)
     writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr2"') // the PR changed
+    touchPr(e, 'abcdef11')
     await until('polled comment', () => hellos(s, 970))
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'a PR whose response changed but not the PR itself (a push elsewhere in the repo) is not caught up',
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1', FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr1"')
+    const { s } = await polling(e, NO_ADMIN, 'sess-digest', 'abcdef18')
+    const ghLog = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '')
+    const count = (re: RegExp) => ghLog().match(re)?.length ?? 0
+    await until('a conditional probe', () => count(/call repos\/o\/r\/pulls\/7 inm="pr1"/g))
+    serve(e, 'repos/o/r/issues/7/comments', [apiComment(975, new Date().toISOString())])
+    const fetched = count(/call repos\/o\/r\/issues\/7\/comments/g)
+    // a new ETag on every probe, as the embedded repo's pushed_at moves, with the PR's own fields the same
+    for (const tag of ['"pr2"', '"pr3"', '"pr4"']) {
+      writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, tag)
+      await until(`a probe answered ${tag}`, () => count(new RegExp(`call repos/o/r/pulls/7 inm=${tag}`, 'g')))
+    }
+    expect(count(/call repos\/o\/r\/issues\/7\/comments/g)).toBe(fetched) // no catch-up
+    expect(hellos(s, 975)).toBe(0)
+    touchPr(e, 'abcdef18') // the comment bumps the PR's updated_at
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr5"')
+    await until('polled comment', () => hellos(s, 975))
     await s.close()
   },
   T,
@@ -1436,6 +1497,7 @@ test(
     await until('polling notice', () => s.got.length)
     expect(s.got[0].content).toBe('pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: no admin on the repo)')
     serve(e, 'repos/o/r/issues/7/comments', [apiComment(980, new Date().toISOString())])
+    touchPr(e, 'abcdef13')
     await until('polled comment', () => hellos(s, 980))
     expect(forwarders(e).size).toBe(0) // never even tried
     await s.close()
