@@ -37,7 +37,18 @@ export const REQUIRED_USER_SCOPES = ['channels:history', 'groups:history', 'im:h
 // Not needed by the listener; they let subscribe_conversation check membership and Slack Connect up front.
 export const SUBSCRIBE_SCOPES = ['channels:read', 'groups:read', 'im:read', 'mpim:read']
 
-export type Identity = { userId: string; teamId: string; enterpriseId?: string; url: string; missingScopes: string[]; missingSubscribeScopes: string[] }
+// Slack only sends reaction_added and reaction_removed to an app with this scope.
+export const REACTION_SCOPES = ['reactions:read']
+
+export type Identity = {
+  userId: string
+  teamId: string
+  enterpriseId?: string
+  url: string
+  missingScopes: string[]
+  missingSubscribeScopes: string[]
+  missingReactionScopes: string[]
+}
 
 export async function whoami(userToken: string): Promise<Identity> {
   const { body, scopes } = await api('auth.test', userToken)
@@ -48,6 +59,7 @@ export async function whoami(userToken: string): Promise<Identity> {
     url: body.url,
     missingScopes: REQUIRED_USER_SCOPES.filter(s => !scopes.includes(s)),
     missingSubscribeScopes: SUBSCRIBE_SCOPES.filter(s => !scopes.includes(s)),
+    missingReactionScopes: REACTION_SCOPES.filter(s => !scopes.includes(s)),
   }
 }
 
@@ -87,20 +99,33 @@ export async function newestMessageAt(userToken: string, channel: string, me: Me
   return m?.ts ? Number(m.ts) * 1000 : 0
 }
 
-const names = new Map<string, { name: string; at: number }>()
+type UserInfo = { name: string; botIds: string[] | null }
+const users = new Map<string, UserInfo & { at: number }>()
 
-// Display name for the record, cached for a day; falls back to the id if the lookup fails.
-export async function userName(userToken: string, id: string): Promise<string> {
-  const hit = names.get(id)
-  if (hit && Date.now() - hit.at < 86_400_000) return hit.name
+// Display name, and for a bot user its bot and app ids (null for a person), cached for a day. A failed lookup gives
+// the id as the name and counts as a person, so it is retried on the next call rather than cached.
+export async function userInfo(userToken: string, id: string): Promise<UserInfo> {
+  const hit = users.get(id)
+  if (hit && Date.now() - hit.at < 86_400_000) return hit
   try {
     const u = (await api('users.info', userToken, { user: id })).body.user
     const name = u?.profile?.display_name || u?.real_name || u?.name || id
-    names.set(id, { name, at: Date.now() })
-    return name
+    const bot = u?.is_bot || id === 'USLACKBOT'
+    const info = { name, botIds: bot ? ([u?.profile?.bot_id, u?.profile?.api_app_id].filter(Boolean) as string[]) : null }
+    users.set(id, { ...info, at: Date.now() })
+    return info
   } catch {
-    return id
+    return { name: id, botIds: null }
   }
+}
+
+export const userName = async (userToken: string, id: string) => (await userInfo(userToken, id)).name
+
+// The thread a message is in: its thread_ts (its own ts if it starts one), or null if it is in none. conversations.replies
+// takes any message of a thread and returns the parent first.
+export async function itemThread(userToken: string, channel: string, ts: string): Promise<string | null> {
+  const { body } = await api('conversations.replies', userToken, { channel, ts, limit: '1' })
+  return body.messages?.[0]?.thread_ts ?? null
 }
 
 // A fresh Socket Mode WebSocket URL. Each URL works once.

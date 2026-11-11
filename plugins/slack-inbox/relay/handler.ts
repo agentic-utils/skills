@@ -1,7 +1,7 @@
 // The hosted half of relay mode: receives Slack's Events API posts, seals each event to the user's public key and
 // queues the ciphertext for their machine to pull, keeping it for a while so it can be replayed. Web standards only, so it runs on Workers and under Bun tests.
 // It holds no Slack token and can't read what it has stored.
-import { type EventsApiPayload, passesRelay } from '../src/match'
+import { type EventsApiPayload, passesRelay, REACTION_EVENTS } from '../src/match'
 
 export type Queued = { id: number; sealed: string }
 
@@ -102,12 +102,27 @@ export const pullMessage = (time: string, after: string) => `pull:${time}:${afte
 // Only what the listener's matching reads, which also keeps the stored queue small.
 export function trim(p: Record<string, any>): Record<string, unknown> {
   const e = p.event ?? {}
-  return {
+  const head = {
     type: p.type,
     event_id: p.event_id,
     team_id: p.team_id,
     enterprise_id: p.enterprise_id,
     is_ext_shared_channel: p.is_ext_shared_channel,
+  }
+  if (REACTION_EVENTS.has(e.type))
+    return {
+      ...head,
+      event: {
+        type: e.type,
+        user: e.user,
+        reaction: e.reaction,
+        item_user: e.item_user,
+        item: { type: e.item?.type, channel: e.item?.channel, ts: e.item?.ts },
+        event_ts: e.event_ts,
+      },
+    }
+  return {
+    ...head,
     event: {
       type: e.type,
       subtype: e.subtype,

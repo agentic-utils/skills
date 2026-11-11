@@ -4,23 +4,29 @@ import { dirname } from 'node:path'
 import { type Config, readSecretFile } from './config'
 import { inHours } from './hours'
 import {
+  botBlocked,
   type EventsApiPayload,
   type Me,
+  needsItemThread,
   PERSONAL,
   PRIORITY,
+  REACTION_EVENTS,
+  REACTION_PRIORITY,
+  reactionTriggers,
   type SlackMessage,
   type Trigger,
   needsThreadLookup,
   permalink,
   preview,
   screen,
+  screenReaction,
   threadKey,
   triggers,
   viaClaude,
   watched,
 } from './match'
 import { createPuller, type RelayKeys } from './pull'
-import { inThread, myGroups, newestMessageAt, SlackError, socketUrl, userName, whoami } from './slack'
+import { inThread, itemThread, myGroups, newestMessageAt, SlackError, socketUrl, userInfo, userName, whoami } from './slack'
 import { readWatches, type Watches, wantsOwnInbox } from './subs'
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), '[slack-inbox]', ...a)
@@ -123,8 +129,14 @@ export type HandlerDeps = {
   // whether to log every message the user posts, not only where a session watches with include_own
   logOwn: () => boolean
   userName: (id: string) => Promise<string>
+  // a reacting user's bot ids, or null for a person: reactions carry no bot flag of their own
+  botIds: (id: string) => Promise<string[] | null>
+  // the thread a message is in (see itemThread), asked only when a thread watch needs it
+  itemThread: (channel: string, ts: string) => Promise<string | null>
   emit: (record: Record<string, unknown>) => void
 }
+
+const THREAD_MEMO = 5000 // messages whose thread the handler remembers, so most reactions need no lookup
 
 // Slack Connect keeps only what is addressed to the user, or is their own post.
 const keep = (hit: Trigger[], external: boolean) => (external ? hit.filter(t => PERSONAL.has(t)) : hit)
@@ -159,11 +171,65 @@ export function createHandler(d: HandlerDeps) {
     })
   }
 
+  // channel:ts -> the message's thread_ts (null: in none), from the messages this handler has seen
+  const threadOf = new Map<string, string | null>()
+  const noteThread = (m: SlackMessage) => {
+    threadOf.set(`${m.channel}:${m.ts}`, m.thread_ts ?? null)
+    if (threadOf.size > THREAD_MEMO) threadOf.delete(threadOf.keys().next().value!)
+  }
+  const lookupThread = async (channel: string, ts: string): Promise<string | undefined> => {
+    const key = `${channel}:${ts}`
+    if (threadOf.has(key)) return threadOf.get(key) ?? undefined
+    let t: string | null
+    try {
+      t = await d.itemThread(channel, ts)
+    } catch (e) {
+      if ((e as { retry?: boolean }).retry) throw e
+      return undefined // not cached, so the next reaction asks again
+    }
+    threadOf.set(key, t)
+    return t ?? undefined
+  }
+
+  const reaction = async (payload: EventsApiPayload) => {
+    const s = screenReaction(payload, d.me)
+    if ('skip' in s) return
+    const r = s.reaction
+    const channel = r.item.channel!
+    const ts = r.item.ts!
+    const watches = d.watches()
+    const known = threadOf.get(`${channel}:${ts}`)
+    const threadTs = known !== undefined ? (known ?? undefined) : needsItemThread(r, watches) ? await lookupThread(channel, ts) : undefined
+    let hit = reactionTriggers(r, d.me, watches, s.own, d.logOwn(), threadTs)
+    if (s.external) hit = hit.filter(t => t === 'own' || t === 'on_own_message')
+    if (!hit.length) return
+    if (!s.own && botBlocked(r.user, await d.botIds(r.user), d.allowBots)) return
+    const item = { channel, ts, thread_ts: threadTs } as SlackMessage
+    d.emit({
+      kind: 'reaction',
+      action: r.type === 'reaction_added' ? 'added' : 'removed',
+      emoji: r.reaction,
+      trigger: REACTION_PRIORITY.find(t => hit.includes(t)),
+      triggers: hit,
+      channel,
+      ts,
+      thread_ts: threadTs ?? null,
+      ...(r.item_user && { item_user: r.item_user }),
+      permalink: permalink(d.teamUrl, item),
+      author: { id: r.user, name: await d.userName(r.user) },
+      event_ts: r.event_ts,
+      ...(s.own && { from_me: true }),
+      ...(s.external && { external: true }),
+    })
+  }
+
   return async (payload: EventsApiPayload) => {
     const marked: string[] = []
     try {
       if (payload.event_id && !firstSighting(payload.event_id, marked)) return
+      if (payload.event && REACTION_EVENTS.has(payload.event.type)) return await reaction(payload)
       const s = screen(payload, d.me, d.allowBots)
+      if (payload.event?.type === 'message' && !('skip' in s && s.skip === 'subtype')) noteThread(payload.event)
       if ('skip' in s) {
         if (s.skip !== 'own') return
         if (s.thread) d.remember(s.thread)
@@ -199,6 +265,7 @@ export async function run(cfg: Config) {
 
   const id = await whoami(cfg.userToken)
   if (id.missingScopes.length) log(`warning: user token lacks ${id.missingScopes.join(', ')}; some messages won't arrive`)
+  if (id.missingReactionScopes.length) log(`user token lacks ${id.missingReactionScopes.join(', ')}, so no reactions will arrive`)
   const me: Me = { userId: id.userId, teamId: id.teamId, enterpriseId: id.enterpriseId }
 
   // Threads the user started or replied in, kept across restarts so old threads still count.
@@ -284,6 +351,16 @@ export async function run(cfg: Config) {
     watches: () => (refresh(), watches),
     logOwn: () => cfg.includeOwn || (refresh(), ownInbox),
     userName: id => userName(cfg.userToken, id),
+    botIds: async id => (await userInfo(cfg.userToken, id)).botIds,
+    itemThread: async (channel, ts) => {
+      try {
+        return await itemThread(cfg.userToken, channel, ts)
+      } catch (e) {
+        log(`thread lookup for reaction on ${channel}:${ts} failed: ${(e as Error).message}`)
+        // as with userInThread: the relay still holds the event, so it can wait for Slack
+        throw Object.assign(e as Error, { retry: !!cfg.relayUrl && slackMayRecover(e) })
+      }
+    },
     emit,
   })
 

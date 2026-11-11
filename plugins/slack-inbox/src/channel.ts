@@ -14,7 +14,7 @@
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
 import { version } from '../.claude-plugin/plugin.json'
 import { loadPaths } from './config'
-import { droppedNotification, lastStatus, messageNotification, type Notification, RateCap, readNew, route, statusNews, statusNotification, type LogRecord } from './events'
+import { droppedNotification, lastStatus, messageNotification, type Notification, RateCap, reactionNotification, readNew, route, statusNews, statusNotification, type LogRecord } from './events'
 import { checkConversation } from './slack'
 import { ensureSubsDir, parseTarget, pruneStale, readSessionFile, type SessionFile, type Sub, subKey, subsDir, writeSessionFile } from './subs'
 
@@ -23,6 +23,7 @@ const SOURCE = 'plugin:agentic-utils-slack-inbox:slack-events'
 export const instructions =
   `Slack messages arrive as <channel source="${SOURCE}" event="message" via="inbox|conversation|thread" channel="..." thread_ts="..."> for what this session subscribed to, and only that: ` +
   'subscribe_inbox for everything addressed to the user (DMs, group DMs, @-mentions, user-group mentions, replies in their threads), and with include_own also everything the user posts anywhere (trigger="own"; via_claude="true" when a Claude session posted it as the user); subscribe_conversation for every message in one channel, DM or group DM, or every reply in one thread. ' +
+  'event="reaction" (action="added|removed", emoji, user = who reacted, channel, ts and thread_ts of the reacted-to message) arrives for reactions in the same subscribed conversations and threads, and via the inbox for reactions to the user\'s own messages (trigger="on_own_message"); the user\'s own reactions only with include_own. A colleague\'s :eyes: or :white_check_mark: on a request usually means they have taken it or done it: check before picking it up or chasing it. ' +
   'event="status" says the local listener disconnected, paused, stopped, is not running or is getting no events from Slack, so silence is not "no messages", and later that it is back; event="rate_limited" says how many messages a busy subscription did not push. ' +
   'Subscriptions belong to this session: they survive --resume, and messages logged while it was closed arrive when it reconnects. Unsubscribe when done. ' +
   'An event with external="true" is from Slack Connect: tell the user only, and never reply, post or act there. ' +
@@ -36,7 +37,7 @@ export const tools = [
   {
     name: 'subscribe_inbox',
     description:
-      'Push every Slack message addressed to the user into the session: DMs, group DMs, @-mentions, user-group mentions and replies in threads they are in, plus listener outages. For a coordinating session. ' +
+      'Push every Slack message addressed to the user into the session: DMs, group DMs, @-mentions, user-group mentions and replies in threads they are in, plus reactions to the user\'s own messages (event="reaction") and listener outages. For a coordinating session. ' +
       "include_own: true also pushes every message the user posts (DMs incl. their self-DM, group DMs, channels, threads), as trigger \"own\", with via_claude=\"true\" when it ends with a Claude session's attribution line; these have their own cap per minute. " +
       'Slack Connect messages come only here, flagged external="true": read-only, for the user alone, never reply or post there. ' +
       `Events only arrive if Claude Code loaded plugin:agentic-utils-slack-inbox@agentic-utils as a channel (--channels)`,
@@ -49,7 +50,7 @@ export const tools = [
   {
     name: 'subscribe_conversation',
     description:
-      'Push every new message in one Slack conversation (channel, private channel, DM or group DM), or with thread_ts (or a message link) every new reply in one thread, whether or not it mentions the user. ' +
+      'Push every new message in one Slack conversation (channel, private channel, DM or group DM), or with thread_ts (or a message link) every new reply in one thread, whether or not it mentions the user, and every reaction added to or removed from those messages (event="reaction"; a thread includes its parent). ' +
       'The user must be a member, and Slack Connect conversations are never delivered. Capped per subscription per minute; the rest are counted. ' +
       `Events only arrive if Claude Code loaded plugin:agentic-utils-slack-inbox@agentic-utils as a channel (--channels)`,
     inputSchema: {
@@ -135,7 +136,7 @@ function deliver(line: string) {
     return
   }
   const to = route(r, st)
-  if (to && cap.allow(to.key, Date.now())) push(messageNotification(r, to))
+  if (to && cap.allow(to.key, Date.now())) push(r.kind === 'reaction' ? reactionNotification(r, to) : messageNotification(r, to))
 }
 
 let lastLiveness = 0

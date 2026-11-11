@@ -8,7 +8,7 @@ import { inHours } from './hours'
 import { createPuller, generateRelayKeys, publicKeys, type RelayKeys } from './pull'
 import { parseWhen, replay } from './replay'
 import { run } from './run'
-import { inThread, myGroups, socketUrl, userName, whoami } from './slack'
+import { inThread, myGroups, socketUrl, userInfo, userName, whoami } from './slack'
 
 const USAGE = `usage: slack-inbox <run|check|relay-keygen|replay> [--config file] [--hours HH:MM-HH:MM] [--days mon-fri] [--log file]
 
@@ -40,6 +40,8 @@ async function check(flags: Parameters<typeof loadConfig>[0]) {
   if (id.missingScopes.length) console.log(`user token: MISSING scopes ${id.missingScopes.join(', ')}`)
   if (id.missingSubscribeScopes.length)
     console.log(`user token: without ${id.missingSubscribeScopes.join(', ')}, subscribe_conversation can't check membership there (optional)`)
+  if (id.missingReactionScopes.length)
+    console.log(`user token: without ${id.missingReactionScopes.join(', ')}, no reactions arrive; also subscribe the app to reaction_added and reaction_removed (optional)`)
   const groups = await myGroups(cfg.userToken, id.userId)
   console.log(`user groups: member of ${groups.size}`)
   if (cfg.relayUrl) {
@@ -78,6 +80,7 @@ async function replayCommand(v: { since?: string; until?: string; channel?: stri
       }
     },
     userName: u => userName(cfg.userToken, u),
+    botIds: async u => (await userInfo(cfg.userToken, u)).botIds,
     filter: { since: parseWhen(v.since, now), until: v.until ? parseWhen(v.until, now) : undefined, channel: v.channel, all: v.all === true },
     outFile,
     log: m => console.error(m),

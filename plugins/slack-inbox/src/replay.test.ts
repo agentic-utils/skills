@@ -42,6 +42,7 @@ const run = async (sealed: string[], filter: Partial<ReplayFilter> = {}, over: R
     groups: new Set(),
     userInThread: async () => false,
     userName: async id => `name-${id}`,
+    botIds: async (id: string) => (id === 'UBOT' ? ['B1'] : null),
     filter: { since: SINCE, all: false, ...filter },
     outFile,
     log: () => {},
@@ -67,6 +68,35 @@ test('the filter takes a time window and a conversation', () => {
   expect(inFilter(p, { since: 0, until: NOW - 1000, all: false })).toBe(false)
   expect(inFilter(p, { since: 0, channel: 'C2', all: false })).toBe(false)
   expect(inFilter({ type: 'event_callback' }, { since: 0, all: false })).toBe(false)
+})
+
+const reaction = (id: string, atMs: number, r: Record<string, unknown> = {}) =>
+  seal(
+    JSON.stringify({
+      type: 'event_callback',
+      event_id: id,
+      team_id: 'T1',
+      event: { type: 'reaction_added', user: 'UOTHER', reaction: 'eyes', item_user: 'UPOSTER', item: { type: 'message', channel: 'C1', ts: '1.000100' }, event_ts: `${atMs / 1000}.000100`, ...r },
+    }),
+  )
+
+test('the filter places a reaction by when it was made, in its item\'s conversation', () => {
+  const p = { type: 'event_callback', event: { type: 'reaction_added', item: { type: 'message', channel: 'C1', ts: '1.000100' }, event_ts: `${NOW / 1000}.000100` } } as never
+  expect(inFilter(p, { since: NOW - 1000, all: false })).toBe(true)
+  expect(inFilter(p, { since: NOW + 2000, all: false })).toBe(false)
+  expect(inFilter(p, { since: 0, channel: 'C1', all: false })).toBe(true)
+  expect(inFilter(p, { since: 0, channel: 'C2', all: false })).toBe(false)
+})
+
+test('reactions: on the user\'s own messages by default, every one from a person with --all', async () => {
+  const sealed = [reaction('a', NOW - 1000), reaction('b', NOW - 1000, { item_user: 'UME' }), reaction('c', NOW - 1000, { user: 'UBOT' })]
+  const mine = await run(sealed)
+  expect(mine.lines).toEqual([expect.objectContaining({ kind: 'reaction', trigger: 'on_own_message', emoji: 'eyes', replayed: true })])
+  const all = await run(sealed, { all: true })
+  expect(all.lines.map(l => [l.kind, l.trigger, l.author.id])).toEqual([
+    ['reaction', 'replay', 'UOTHER'],
+    ['reaction', 'replay', 'UOTHER'],
+  ])
 })
 
 test('by default it writes what was addressed to the user, in full, to a private file of its own', async () => {
