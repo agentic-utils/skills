@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { appendFileSync, mkdtempSync, renameSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { lastStatus, messageNotification, RateCap, readNew, route, statusNews } from './events'
+import { droppedNotification, lastStatus, messageNotification, RateCap, reactionNotification, readNew, route, statusNews } from './events'
 import type { SessionFile } from './subs'
 
 const msg = (r: Record<string, unknown> = {}) => ({ kind: 'message', channel: 'C1', ts: '1762160000.000200', thread_ts: null, triggers: ['dm'], ...r })
@@ -30,6 +30,47 @@ test('route sends own messages to an inbox with include_own, on a cap of their o
   expect(route(msg({ from_me: true, triggers: ['watched_conversation'] }), subs({ inbox: true, inbox_own: true }))).toBeNull()
   // a conversation watched with include_own is more specific
   expect(route(msg({ from_me: true, triggers: ['own', 'watched_conversation'] }), subs({ inbox: true, inbox_own: true, conversations: [{ conversation: 'C1', include_own: true }] }))?.via).toBe('conversation')
+})
+
+const rx = (r: Record<string, unknown> = {}) =>
+  msg({ kind: 'reaction', action: 'added', emoji: 'eyes', triggers: ['watched_conversation'], trigger: 'watched_conversation', author: { id: 'U2', name: 'sam' }, item_user: 'U3', ...r })
+
+test('route sends reactions where the same message would go, on a cap apart from messages', () => {
+  const thread = { conversation: 'C1', thread_ts: '1762150000.000100' }
+  expect(route(rx(), subs({ conversations: [{ conversation: 'C1' }] }))).toEqual({ via: 'conversation', key: 'C1:reactions' })
+  // a thread subscription gets reactions on its parent and on its replies
+  expect(route(rx({ ts: '1762150000.000100' }), subs({ conversations: [thread] }))).toEqual({ via: 'thread', key: 'C1:1762150000.000100:reactions' })
+  expect(route(rx({ thread_ts: '1762150000.000100' }), subs({ conversations: [thread] }))?.via).toBe('thread')
+  expect(route(rx(), subs({ conversations: [thread] }))).toBeNull()
+  // the inbox: reactions to the user's own messages, and their own reactions only with include_own
+  expect(route(rx(), subs({ inbox: true }))).toBeNull()
+  expect(route(rx({ channel: 'C9', triggers: ['on_own_message'] }), subs({ inbox: true }))).toEqual({ via: 'inbox', key: 'inbox:reactions' })
+  expect(route(rx({ from_me: true, triggers: ['own'] }), subs({ inbox: true }))).toBeNull()
+  expect(route(rx({ from_me: true, triggers: ['own'] }), subs({ inbox: true, inbox_own: true }))).toEqual({ via: 'inbox', key: 'inbox:own:reactions' })
+  expect(route(rx({ from_me: true }), subs({ conversations: [{ conversation: 'C1' }] }))).toBeNull()
+  expect(route(rx({ external: true, triggers: ['on_own_message'] }), subs({ inbox: true, conversations: [{ conversation: 'C1' }] }))).toEqual({ via: 'inbox', key: 'inbox:reactions' })
+})
+
+test('reactionNotification says who reacted with what, to which message', () => {
+  const n = reactionNotification(rx({ thread_ts: '1762150000.000100', permalink: 'https://x/p1' }), { via: 'conversation', key: 'C1:reactions' })
+  expect(n.content).toBe('sam (U2) reacted :eyes: to a message by U3 1762160000.000200 in thread 1762150000.000100 in C1\nhttps://x/p1')
+  expect(n.meta).toEqual({
+    event: 'reaction',
+    action: 'added',
+    emoji: 'eyes',
+    via: 'conversation',
+    trigger: 'watched_conversation',
+    channel: 'C1',
+    ts: '1762160000.000200',
+    thread_ts: '1762150000.000100',
+    user: 'U2',
+    item_user: 'U3',
+  })
+  expect(reactionNotification(rx({ action: 'removed', emoji: '+1', trigger: 'on_own_message' }), { via: 'inbox', key: 'inbox:reactions' }).content).toStartWith(
+    'sam (U2) removed :+1: from your message',
+  )
+  expect(reactionNotification(rx({ emoji: '+1' }), { via: 'inbox', key: 'inbox' }).meta.emoji).toBe('+1')
+  expect(droppedNotification('C1:reactions', 3, 20).content).toStartWith('3 more Slack reactions for C1:reactions')
 })
 
 test('route keeps Slack Connect to the inbox, never a conversation', () => {

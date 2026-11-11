@@ -26,14 +26,26 @@ export type SlackMessage = {
   parent_user_id?: string
 }
 
+// reaction_added / reaction_removed. Slack gives the reacting user, the emoji and the item, never the item's thread.
+export type SlackReaction = {
+  type: 'reaction_added' | 'reaction_removed'
+  user: string
+  reaction: string
+  item_user?: string // who posted the item
+  item: { type: string; channel?: string; ts?: string }
+  event_ts: string
+}
+
 export type EventsApiPayload = {
   type: string
   event_id?: string
   team_id?: string
   enterprise_id?: string | null
   is_ext_shared_channel?: boolean
-  event?: SlackMessage
+  event?: SlackMessage // or a reaction event, which screenReaction reads
 }
+
+export const REACTION_EVENTS: ReadonlySet<string> = new Set(['reaction_added', 'reaction_removed'])
 
 // Subtypes that are a person (or an allowed bot) saying something new. Edits, deletes, joins and the rest are skipped.
 const SPOKEN = new Set([undefined, 'thread_broadcast', 'file_share', 'me_message', 'bot_message'])
@@ -65,11 +77,56 @@ export function screen(payload: EventsApiPayload, me: Me, allowBots: Set<string>
   return { message: m, external }
 }
 
-// Whether the relay stores an event: only what screen keeps, plus the user's own messages. Everything else would be
-// dropped by the listener and replay anyway, and on a busy workspace bots are most of the traffic and of D1's writes.
+export type ScreenedReaction = { skip: 'not_reaction' | 'not_message_item' } | { reaction: SlackReaction; own: boolean; external: boolean }
+
+// The reaction counterpart of screen. Reactions on files and file comments are skipped: there is no message to point
+// at. A reaction event says nothing about whether the reactor is a bot, so that is botBlocked's job, with a lookup.
+export function screenReaction(payload: EventsApiPayload, me: Me): ScreenedReaction {
+  const r = payload.event as unknown as SlackReaction | undefined
+  if (payload.type !== 'event_callback' || !r || !REACTION_EVENTS.has(r.type) || typeof r.user !== 'string' || typeof r.reaction !== 'string')
+    return { skip: 'not_reaction' }
+  if (r.item?.type !== 'message' || typeof r.item.channel !== 'string' || typeof r.item.ts !== 'string') return { skip: 'not_message_item' }
+  return { reaction: r, own: r.user === me.userId, external: !!payload.is_ext_shared_channel }
+}
+
+// The allow_bots rule for a reacting user. `botIds`: the bot's ids (user, bot and app id) from users.info, or null
+// for a person.
+export const botBlocked = (user: string, botIds: string[] | null, allowBots: Set<string>) =>
+  !!botIds && ![user, ...botIds].some(id => allowBots.has(id))
+
+// Whether the relay stores an event: only what screen keeps, plus the user's own messages, and reactions to messages.
+// Everything else would be dropped by the listener and replay anyway, and on a busy workspace bots are most of the
+// traffic and of D1's writes. The relay can't tell a reacting bot from a person, so the listener drops those.
 export const passesRelay = (payload: EventsApiPayload, me: Me, allowBots: Set<string>) => {
+  if (payload.event && REACTION_EVENTS.has(payload.event.type)) return !('skip' in screenReaction(payload, me))
   const s = screen(payload, me, allowBots)
   return !('skip' in s) || s.skip === 'own'
+}
+
+// What a reaction is logged for. `on_own_message`: someone reacted to the user's message (personal, so the inbox).
+// `own`: the user reacted, logged only where asked for. `threadTs`: the item's thread, when known (the item's own ts
+// if it starts one); a reaction to a watched thread's parent counts for that thread.
+export type ReactionTrigger = 'own' | 'on_own_message' | 'watched_thread' | 'watched_conversation'
+export const REACTION_PRIORITY: ReactionTrigger[] = ['own', 'on_own_message', 'watched_thread', 'watched_conversation']
+
+export function reactionTriggers(r: SlackReaction, me: Me, watches: Map<string, boolean>, own: boolean, logOwn: boolean, threadTs?: string): ReactionTrigger[] {
+  const channel = r.item.channel!
+  const ts = r.item.ts!
+  const out: ReactionTrigger[] = []
+  const wants = (k: string) => watches.has(k) && (!own || watches.get(k) === true)
+  if (own && logOwn) out.push('own')
+  if (!own && r.item_user === me.userId) out.push('on_own_message')
+  if (wants(threadKey(channel, ts)) || (threadTs && wants(threadKey(channel, threadTs)))) out.push('watched_thread')
+  if (wants(channel)) out.push('watched_conversation')
+  return out
+}
+
+// Whether matching a reaction needs its item's thread: only when some session watches a thread in that conversation
+// and the item isn't that thread's parent.
+export const needsItemThread = (r: SlackReaction, watches: Map<string, boolean>) => {
+  const prefix = `${r.item.channel}:`
+  for (const k of watches.keys()) if (k.startsWith(prefix) && k !== `${prefix}${r.item.ts}`) return true
+  return false
 }
 
 const SUBTEAM = /<!subteam\^([A-Z0-9]+)/g

@@ -2,7 +2,7 @@
 // listener's cursor or any session, so it can run beside the listener and repeat nothing to anyone.
 import { appendFileSync, closeSync, mkdtempSync, openSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { type EventsApiPayload, type Me, permalink, preview, screen } from './match'
+import { botBlocked, type EventsApiPayload, type Me, permalink, preview, REACTION_EVENTS, type SlackMessage, type SlackReaction, screen, screenReaction } from './match'
 import { createPuller, type Fetch, type RelayKeys } from './pull'
 import { createHandler } from './run'
 
@@ -19,11 +19,15 @@ export function parseWhen(value: string, now: number): number {
 
 export type ReplayFilter = { since: number; until?: number; channel?: string; all: boolean }
 
+// A reaction is placed by when it was made, and in its item's conversation.
 export function inFilter(p: EventsApiPayload, f: ReplayFilter): boolean {
   const e = p.event
-  if (!e?.ts) return false
-  const at = Number(e.ts) * 1000
-  return at >= f.since && (f.until === undefined || at <= f.until) && (!f.channel || e.channel === f.channel)
+  const r = REACTION_EVENTS.has(e?.type ?? '') ? (e as unknown as SlackReaction) : undefined
+  const ts = r ? r.event_ts : e?.ts
+  const channel = r ? r.item?.channel : e?.channel
+  if (!ts) return false
+  const at = Number(ts) * 1000
+  return at >= f.since && (f.until === undefined || at <= f.until) && (!f.channel || channel === f.channel)
 }
 
 export type ReplayDeps = {
@@ -35,6 +39,7 @@ export type ReplayDeps = {
   groups: Set<string>
   userInThread: (channel: string, threadTs: string) => Promise<boolean>
   userName: (id: string) => Promise<string>
+  botIds: (id: string) => Promise<string[] | null>
   filter: ReplayFilter
   outFile: string
   log: (msg: string) => void
@@ -63,12 +68,35 @@ export async function replay(d: ReplayDeps): Promise<ReplayResult> {
     watches: () => new Map(),
     logOwn: () => false,
     userName: d.userName,
+    botIds: d.botIds,
+    itemThread: async () => null, // nothing is watched here, so it is never asked
     emit,
   })
 
-  // Every message rather than only those addressed to the user. Slack Connect stays limited to what is addressed to
-  // the user, as in the live log, so an unaddressed one is left out here too.
+  // Every message and reaction rather than only those addressed to the user. Slack Connect stays limited to what is
+  // addressed to the user, as in the live log, so an unaddressed one is left out here too.
   const everything = async (p: EventsApiPayload) => {
+    if (REACTION_EVENTS.has(p.event?.type ?? '')) {
+      const s = screenReaction(p, d.me)
+      if ('skip' in s) return
+      if (s.external) return matched(p)
+      const r = s.reaction
+      if (!s.own && botBlocked(r.user, await d.botIds(r.user), d.allowBots)) return
+      return emit({
+        kind: 'reaction',
+        action: r.type === 'reaction_added' ? 'added' : 'removed',
+        emoji: r.reaction,
+        trigger: 'replay',
+        channel: r.item.channel,
+        ts: r.item.ts,
+        thread_ts: null,
+        ...(r.item_user && { item_user: r.item_user }),
+        permalink: permalink(d.teamUrl, { channel: r.item.channel!, ts: r.item.ts! } as SlackMessage),
+        author: { id: r.user, name: await d.userName(r.user) },
+        event_ts: r.event_ts,
+        ...(s.own && { from_me: true }),
+      })
+    }
     const s = screen(p, d.me, d.allowBots)
     if ('skip' in s && s.skip !== 'own') return
     if (s.external) return matched(p)

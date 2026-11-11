@@ -54,6 +54,23 @@ And it is never logged when it is:
 
 A message from a Slack Connect conversation, or from a user of another organisation, is logged only for the personal triggers and `own`, never for a session's `watched_*` subscription, and carries `"external":true`. Those conversations include people outside your organisation: a consumer must never reply or post in them, and must route such a record to you alone, never to a session that works on it in Slack. The channel server pushes them only to the inbox, with the same warning in the event text.
 
+### Reactions
+
+An emoji reaction added or removed (`reaction_added`, `reaction_removed`) is logged as `"kind":"reaction"` when it is any of:
+
+| `trigger`              | When                                                                                                 |
+| ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `own`                  | You reacted, and own messages were asked for (as above)                                              |
+| `on_own_message`       | Someone reacted to a message you posted                                                              |
+| `watched_thread`       | A reaction to the parent or a reply of a thread some session subscribed to                           |
+| `watched_conversation` | A reaction to any message in a channel, DM or group DM some session subscribed to                    |
+
+The use: a coordinating session that watches a channel for requests can see that a colleague already put :eyes: or :white_check_mark: on one, and not pick it up twice or chase it. Your own reactions follow the same rule as your own messages (`own`, or a subscription with `include_own`). A bot's reactions follow the bot allow-list; as a reaction event doesn't say whether the reactor is a bot, the listener asks `users.info` once a day per reactor. In Slack Connect only `on_own_message` and `own` are logged. Reactions to files are skipped.
+
+Slack doesn't say which thread a reacted-to message is in. The listener remembers the thread of the last 5,000 messages it saw, and asks Slack (`conversations.replies`) only when a session watches a thread in that conversation and the message isn't one it remembers.
+
+Reactions need the user scope `reactions:read` and the app subscribed to the user events `reaction_added` and `reaction_removed` (both in the manifest). Without them the listener runs as before and `check` says what is missing.
+
 Your user groups are fetched at start-up and every 30 minutes (`usergroups.list`), so a group you join is picked up within that time. Threads you take part in are remembered for 30 days in the state directory. For a reply in a thread the listener hasn't seen you in, it asks Slack once (`conversations.replies`) and caches a "no" for 10 minutes.
 
 ### Record format
@@ -65,6 +82,14 @@ One JSON object per line. Messages:
 ```
 
 `trigger` is the most specific of `triggers` (in the order of the table above). `text` is a one-line preview, cut to 200 characters by default; mentions stay in Slack's `<@U…>` form. `channel_type` is `channel`, `group` (private channel), `im` or `mpim`.
+
+Reactions:
+
+```json
+{"kind":"reaction","action":"added","emoji":"eyes","trigger":"watched_conversation","triggers":["watched_conversation"],"channel":"C0123456789","ts":"1762160000.123456","thread_ts":null,"item_user":"U0987654321","permalink":"https://example.slack.com/archives/C0123456789/p1762160000123456","author":{"id":"U0123456789","name":"alex"},"event_ts":"1762160100.000200","at":"2026-11-03T09:15:00.101Z"}
+```
+
+`action` is `added` or `removed`. `emoji` is Slack's name for it, without colons (`eyes`, `white_check_mark`, `+1`, a custom one, or with a skin tone such as `+1::skin-tone-2`). `channel`, `ts` and `thread_ts` are the reacted-to message's (`thread_ts` is null when not known, see above), `item_user` is who posted it, and `author` is who reacted.
 
 The listener also writes status lines, so a consumer can tell a quiet inbox from a dead one:
 
@@ -84,6 +109,7 @@ The listener needs two tokens from the **same** Slack app:
 
 - an **app-level token** (`xapp-…`) with `connections:write`, to open the Socket Mode connection
 - a **user token** (`xoxp-…`) with `channels:history`, `groups:history`, `im:history`, `mpim:history`, `usergroups:read` and `users:read`, and the app subscribed to the user events `message.channels`, `message.groups`, `message.im` and `message.mpim`
+- for [reactions](#reactions), also `reactions:read` and the user events `reaction_added` and `reaction_removed`
 
 User events are what make this work: Slack sends the app every message in every conversation you are a member of, as you see it, and the listener filters them locally. A bot token would only see conversations the bot was invited to.
 
@@ -109,8 +135,8 @@ You can reuse an app you own, but know what changes:
 
 1. **Socket Mode** > enable. This stops Slack sending this app's events and interactions to any HTTP Request URL; anything relying on those breaks.
 2. **Basic Information** > **App-Level Tokens**: generate one with `connections:write`.
-3. **OAuth & Permissions** > **User Token Scopes**: add whichever of the six scopes above are missing.
-4. **Event Subscriptions** > enable > **Subscribe to events on behalf of users**: add the four `message.*` events.
+3. **OAuth & Permissions** > **User Token Scopes**: add whichever of the six scopes above are missing, and `reactions:read` for reactions.
+4. **Event Subscriptions** > enable > **Subscribe to events on behalf of users**: add the four `message.*` events, and `reaction_added` and `reaction_removed` for reactions.
 5. Reinstall the app. Slack shows a new User OAuth Token; the scopes you added only apply to that token. Replace the old one everywhere you use it.
 
 The listener only reads, but the user token carries every scope the app has, write scopes included. A dedicated app keeps the token the listener holds read-only.
@@ -173,7 +199,7 @@ It points at the marketplace checkout (`~/.claude/plugins/marketplaces/agentic-u
 A laptop can't hold a socket while it is asleep. Messages sent meanwhile are lost, and if enough deliveries fail, Slack can turn events off for the app until someone turns them back on. In relay mode Slack posts each event over HTTP to a small hosted [Cloudflare Worker](relay/worker.ts), which seals it and queues it. The listener pulls the queue every 10 seconds while awake, and drains it on waking.
 
 - **What the relay holds:** Slack's signing secret and your public keys. No Slack token, and no private key.
-- **What it stores:** every message people post in every conversation you are in, not only those addressed to you, as ciphertext with an event id. Matching happens later, on your machine. Only your machine's private key can open it. Bot messages, edits, deletes and joins are dropped before storing, as the listener and `replay` drop them anyway; on a workspace with busy alert channels they are most of the traffic, and every stored event costs D1 writes (the free plan allows 100,000 a day, about 33,000 events). Your own messages are kept even when an app posts them. A bot on the listener's `allow_bots` must also be in the relay's `RELAY_ALLOW_BOTS` (comma separated), or its messages never reach the queue.
+- **What it stores:** every message people post in every conversation you are in, not only those addressed to you, as ciphertext with an event id. Matching happens later, on your machine. Only your machine's private key can open it. Bot messages, edits, deletes and joins are dropped before storing, as the listener and `replay` drop them anyway; on a workspace with busy alert channels they are most of the traffic, and every stored event costs D1 writes (the free plan allows 100,000 a day, about 33,000 events). Your own messages are kept even when an app posts them. A bot on the listener's `allow_bots` must also be in the relay's `RELAY_ALLOW_BOTS` (comma separated), or its messages never reach the queue. Reactions to messages are stored too, as the relay can't know which conversations sessions watch; a reaction event doesn't say whether a bot made it, so bots' reactions are stored and the listener drops them. Reactions to files are not stored.
 - **How long:** every event stays for 14 days (`RELAY_MAX_AGE_DAYS`), whether or not it has been collected, so recent messages can be replayed. A daily job deletes events past that, and the oldest events if the queue passes 250 MB, half of D1's 500 MB free limit. D1 keeps its own restorable history of deleted data for 7 days on the free plan, and this can't be turned off. There is no way to remove one message early, and a deletion in Slack doesn't remove it here.
 - **When something goes wrong:** the listener reports a `lost` status if it finds events were deleted before it collected them, or any it could not open or handle. If it can't write its log or Slack is unavailable, it stops collecting and tries again, so those events wait in the relay.
 - **What it can't protect against:** each event is in plaintext in the Worker's memory for a moment before sealing, and whoever can deploy to that Cloudflare account could change the code to keep it. This protects stored data, not data in use, so choose the account accordingly.
@@ -213,6 +239,8 @@ Events arrive as `<channel source="plugin:agentic-utils-slack-inbox:slack-events
 - `subscribe_inbox` / `unsubscribe_inbox`: every message addressed to you (the first table above). For a coordinating session. `include_own: true` adds every message you post, anywhere, as `trigger="own"`; the listener starts logging them as soon as one live session asks, whatever `SLACK_INBOX_INCLUDE_OWN` says. Events posted by a Claude session as you carry `via_claude="true"`, and Slack Connect ones `external="true"`.
 - `subscribe_conversation` / `unsubscribe_conversation`: with `conversation` alone, every new message and reply in that channel, private channel, DM or group DM; with `thread_ts`, or a message link, every new reply in that thread. `include_own: true` adds your own messages.
 
+Both also deliver [reactions](#reactions) as `event="reaction"`: the inbox those to your own messages, a conversation or thread subscription those to its messages (a thread's parent included), and your own reactions only with `include_own`. The attributes are `action` (`added` or `removed`), `emoji`, `user` (who reacted), `channel`, `ts` and `thread_ts` (the reacted-to message's) and `item_user` (who posted it); the body says the same in words, with the message's permalink. Reactions are capped apart from messages, under the subscription's key plus `:reactions`, so a flurry of emoji never crowds out what people write.
+
 `conversation` is an id (`C…`, `G…`, `D…`) or a Slack message link. A link names a thread: the one the message is in, or the one it starts. Subscribing checks with `conversations.info` that you are a member and that it isn't Slack Connect, and refuses otherwise. That needs the user scopes `channels:read`, `groups:read`, `im:read` and `mpim:read` (in the manifest); where the token lacks one the subscription is accepted with a "not verified" note. The check reads the user token from `SLACK_INBOX_USER_TOKEN(_FILE)`, the config file's `user_token_file`, or `~/.config/slack-inbox/user-token`.
 
 Also pushed, to every session with a subscription:
@@ -229,6 +257,8 @@ Event text and author names are written by other people. The server's instructio
 Call `subscribe_inbox` once. Each `via="inbox"` event is a message addressed to you; route it to the session that owns that work, or start one, and tell that session the thread's permalink. A `status` event means messages may be missing until the next `connected`.
 
 With `include_own: true` it also sees what you post, including notes to yourself in your self-DM, as `trigger="own"`. Skip the ones with `via_claude="true"`: those are posts a Claude session made as you, quite possibly this one. An `external="true"` event is Slack Connect: tell you about it, and never reply or post there, or hand it to another session.
+
+To watch a team channel for requests, add `subscribe_conversation` on it. Its reactions arrive too: a colleague's `:eyes:` on a request usually means they have taken it, and `:white_check_mark:` (or a team's own `:done:`) that it is done, so check those before picking a request up or chasing it. A `removed` reaction undoes that.
 
 ### A session working one thread
 

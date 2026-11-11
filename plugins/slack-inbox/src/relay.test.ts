@@ -147,6 +147,33 @@ test('people, allowed bots and the owner posting through an app are stored', asy
   expect(rows).toHaveLength(4)
 })
 
+test('reactions to messages are stored with only the fields the listener reads; reactions to files are not', async () => {
+  const { rows, store } = memStore()
+  const relay = setup(store)
+  const reaction = {
+    type: 'reaction_added',
+    user: 'UOTHER',
+    reaction: 'eyes',
+    item_user: 'UME',
+    item: { type: 'message', channel: 'C1', ts: '1.000100', extra: 'x' },
+    event_ts: '2.000100',
+    junk: true,
+  }
+  await relay(post(callback({ event_id: 'Ev1', event: reaction })))
+  await relay(post(callback({ event_id: 'Ev2', event: { ...reaction, type: 'reaction_removed', user: 'UME' } })))
+  await relay(post(callback({ event_id: 'Ev3', event: { ...reaction, item: { type: 'file', file: 'F1' } } })))
+  expect(rows).toHaveLength(2)
+  expect(JSON.parse(openSealed(keys, rows[0].sealed)).event).toEqual({
+    type: 'reaction_added',
+    user: 'UOTHER',
+    reaction: 'eyes',
+    item_user: 'UME',
+    item: { type: 'message', channel: 'C1', ts: '1.000100' },
+    event_ts: '2.000100',
+  })
+  expect(JSON.parse(openSealed(keys, rows[1].sealed)).event.type).toBe('reaction_removed')
+})
+
 test('a Slack retry of the same event is stored once', async () => {
   const { rows, store } = memStore()
   await setup(store)(post(callback()))

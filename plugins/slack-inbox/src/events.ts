@@ -20,19 +20,34 @@ export type LogRecord = {
   from_me?: boolean
   via_claude?: boolean
   external?: boolean
+  // reactions: `ts` and `thread_ts` are the reacted-to message's, `author` the person who reacted
+  action?: 'added' | 'removed'
+  emoji?: string
+  item_user?: string
+  event_ts?: string
 }
 
 export type Via = 'thread' | 'conversation' | 'inbox'
 export type Route = { via: Via; key: string }
 
 // Triggers that mean the message is addressed to the user, as opposed to logged for a session's subscription.
-const PERSONAL = new Set(['dm', 'group_dm', 'mention', 'group_mention', 'thread_reply'])
+// For a reaction, on_own_message: someone reacted to the user's message.
+const PERSONAL = new Set(['dm', 'group_dm', 'mention', 'group_mention', 'thread_reply', 'on_own_message'])
 
-// The most specific subscription of this session a message belongs to, or null. The user's own messages only
+// A reaction belongs to a thread subscription when it is on that thread's parent or on one of its replies.
+const inThread = (r: LogRecord, threadTs: string) => (r.kind === 'reaction' ? r.ts === threadTs || r.thread_ts === threadTs : typeof r.thread_ts === 'string' && r.thread_ts !== r.ts && r.thread_ts === threadTs)
+
+// The most specific subscription of this session a message or reaction belongs to, or null. The user's own only
 // reach a subscription made with include_own: a conversation or thread, or the inbox, where they get a cap of their
-// own (key `inbox:own`) so a burst of the user's posts never crowds out messages addressed to them.
+// own (key `inbox:own`) so a burst of the user's posts never crowds out messages addressed to them. Reactions are
+// capped apart from messages (`<key>:reactions`), so a flurry of emoji never crowds out what people write.
 export function route(r: LogRecord, s: SessionFile): Route | null {
-  if (r.kind !== 'message' || typeof r.channel !== 'string') return null
+  const to = routeOf(r, s)
+  return to && r.kind === 'reaction' ? { ...to, key: `${to.key}:reactions` } : to
+}
+
+function routeOf(r: LogRecord, s: SessionFile): Route | null {
+  if ((r.kind !== 'message' && r.kind !== 'reaction') || typeof r.channel !== 'string') return null
   const own = r.from_me === true
   // Slack Connect goes to the inbox only: it is read-only, for the user's eyes, never a conversation to work in
   if (r.external === true) {
@@ -41,9 +56,8 @@ export function route(r: LogRecord, s: SessionFile): Route | null {
     if (own && s.inbox_own && (r.triggers ?? []).includes('own')) return { via: 'inbox', key: 'inbox:own' }
     return null
   }
-  const reply = typeof r.thread_ts === 'string' && r.thread_ts !== r.ts
   for (const sub of s.conversations) {
-    if (sub.thread_ts && reply && sub.conversation === r.channel && sub.thread_ts === r.thread_ts && (!own || sub.include_own))
+    if (sub.thread_ts && sub.conversation === r.channel && inThread(r, sub.thread_ts) && (!own || sub.include_own))
       return { via: 'thread', key: subKey(sub) }
   }
   for (const sub of s.conversations) {
@@ -63,7 +77,7 @@ export const statusNews = (prev: string | undefined, state: string) => (OUTAGE.h
 
 export type Notification = { content: string; meta: Record<string, string> }
 
-const safe = (v: unknown) => String(v ?? '').replace(/[^\w.:-]/g, '').slice(0, 100)
+const safe = (v: unknown) => String(v ?? '').replace(/[^\w.:+-]/g, '').slice(0, 100)
 
 const meta = (m: Record<string, unknown>) => {
   const out: Record<string, string> = {}
@@ -78,6 +92,30 @@ export function messageNotification(r: LogRecord, route: Route): Notification {
   return {
     content: `${r.trigger ?? 'message'} from ${who} in ${where}${ext}: ${r.text ?? ''}\n${r.permalink ?? ''}`.trim(),
     meta: meta({ event: 'message', via: route.via, trigger: r.trigger, channel: r.channel, ts: r.ts, thread_ts: r.thread_ts, via_claude: r.via_claude ? 'true' : undefined, external: r.external ? 'true' : undefined }),
+  }
+}
+
+export function reactionNotification(r: LogRecord, route: Route): Notification {
+  const who = r.from_me ? 'you' : `${r.author?.name ?? 'unknown'} (${r.author?.id ?? '?'})`
+  const whose = r.trigger === 'on_own_message' ? 'your message' : r.item_user ? `a message by ${r.item_user}` : 'a message'
+  const where = r.thread_ts && r.thread_ts !== r.ts ? `thread ${r.thread_ts} in ${r.channel}` : r.channel
+  const ext = r.external ? ' [Slack Connect, external: read-only, tell the user only, never reply or post there]' : ''
+  const did = r.action === 'removed' ? `removed :${r.emoji}: from` : `reacted :${r.emoji}: to`
+  return {
+    content: `${who} ${did} ${whose} ${r.ts} in ${where}${ext}\n${r.permalink ?? ''}`.trim(),
+    meta: meta({
+      event: 'reaction',
+      action: r.action,
+      emoji: r.emoji,
+      via: route.via,
+      trigger: r.trigger,
+      channel: r.channel,
+      ts: r.ts,
+      thread_ts: r.thread_ts,
+      user: r.author?.id,
+      item_user: r.item_user,
+      external: r.external ? 'true' : undefined,
+    }),
   }
 }
 
@@ -130,7 +168,7 @@ export class RateCap {
 }
 
 export const droppedNotification = (key: string, dropped: number, limit: number): Notification => ({
-  content: `${dropped} more Slack message${dropped === 1 ? '' : 's'} for ${key} in the last minute ${dropped === 1 ? 'was' : 'were'} not pushed (cap: ${limit} a minute per subscription); read the conversation in Slack, or the listener's log, if they matter`,
+  content: `${dropped} more Slack ${key.endsWith(':reactions') ? 'reaction' : 'message'}${dropped === 1 ? '' : 's'} for ${key} in the last minute ${dropped === 1 ? 'was' : 'were'} not pushed (cap: ${limit} a minute per subscription); read the conversation in Slack, or the listener's log, if they matter`,
   meta: meta({ event: 'rate_limited', subscription: key, dropped }),
 })
 

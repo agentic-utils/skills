@@ -14,6 +14,7 @@ oauth_config:
       - groups:read
       - im:read
       - mpim:read
+      - reactions:read
       - usergroups:read
       - users:read
 settings:
@@ -23,6 +24,8 @@ settings:
       - message.groups
       - message.im
       - message.mpim
+      - reaction_added
+      - reaction_removed
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
