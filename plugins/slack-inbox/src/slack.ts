@@ -1,4 +1,5 @@
 // A minimal Slack Web API client. Read-only methods only: this tool never posts, reacts or edits.
+import { type Me, passesRelay, type SlackMessage } from './match'
 
 export class SlackError extends Error {
   constructor(
@@ -78,11 +79,12 @@ export async function inThread(userToken: string, userId: string, channel: strin
   return false
 }
 
-// When the newest message in a conversation was sent, in milliseconds, or 0 if it has none.
-export async function newestMessageAt(userToken: string, channel: string): Promise<number> {
-  const { body } = await api('conversations.history', userToken, { channel, limit: '1' })
-  const ts = body.messages?.[0]?.ts
-  return ts ? Number(ts) * 1000 : 0
+// When the newest message in a conversation that the listener would receive was sent, in milliseconds, or 0 if none
+// of the latest few is one. The relay drops bots off the allow-list, so a bot posting after the last event is no stall.
+export async function newestMessageAt(userToken: string, channel: string, me: Me, allowBots: Set<string>): Promise<number> {
+  const { body } = await api('conversations.history', userToken, { channel, limit: '20' })
+  const m = (body.messages ?? []).find((m: SlackMessage) => passesRelay({ type: 'event_callback', event: { ...m, channel } }, me, allowBots))
+  return m?.ts ? Number(m.ts) * 1000 : 0
 }
 
 const names = new Map<string, { name: string; at: number }>()

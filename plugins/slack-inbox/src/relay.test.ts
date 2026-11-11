@@ -122,6 +122,31 @@ test("another user's events are acknowledged but never stored", async () => {
   expect(rows).toHaveLength(0)
 })
 
+test('bots off the allow-list, edits and joins are acknowledged but never stored', async () => {
+  const { rows, store } = memStore()
+  const msg = { type: 'message', channel: 'C1', channel_type: 'channel', ts: '1.000100', text: 'x' }
+  const sent = [
+    { ...msg, subtype: 'bot_message', bot_id: 'BALERTS' },
+    { ...msg, user: 'UOTHER', bot_id: 'BALERTS', app_id: 'AALERTS' },
+    { ...msg, user: 'USLACKBOT' },
+    { ...msg, subtype: 'message_changed' },
+    { ...msg, subtype: 'channel_join', user: 'UOTHER' },
+  ]
+  for (const [i, event] of sent.entries()) expect((await setup(store)(post(callback({ event_id: `Ev${i}`, event })))).status).toBe(200)
+  expect(rows).toHaveLength(0)
+})
+
+test('people, allowed bots and the owner posting through an app are stored', async () => {
+  const { rows, store } = memStore()
+  const msg = { type: 'message', channel: 'C1', channel_type: 'channel', ts: '1.000100', text: 'x' }
+  const relay = setup(store, { allowBots: new Set(['AKEEP']) })
+  await relay(post(callback({ event_id: 'Ev1' })))
+  await relay(post(callback({ event_id: 'Ev2', event: { ...msg, subtype: 'bot_message', bot_id: 'B9', app_id: 'AKEEP' } })))
+  await relay(post(callback({ event_id: 'Ev3', event: { ...msg, user: 'UME', bot_id: 'BCLAUDE', app_id: 'ACLAUDE' } })))
+  await relay(post(callback({ event_id: 'Ev4', event: { ...msg, user: 'UOTHER', subtype: 'thread_broadcast', thread_ts: '1.000000' } })))
+  expect(rows).toHaveLength(4)
+})
+
 test('a Slack retry of the same event is stored once', async () => {
   const { rows, store } = memStore()
   await setup(store)(post(callback()))

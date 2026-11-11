@@ -10,6 +10,7 @@ type Env = {
   RELAY_OWNER_USER_ID: string
   RELAY_MAX_QUEUE_BYTES?: string
   RELAY_MAX_AGE_DAYS?: string
+  RELAY_ALLOW_BOTS?: string // comma separated, the same ids as the listener's allow_bots
 }
 
 const maxAgeMs = (env: Env) => (env.RELAY_MAX_AGE_DAYS ? Number(env.RELAY_MAX_AGE_DAYS) * 86_400_000 : MAX_AGE_MS)
@@ -35,6 +36,7 @@ export default {
       sealKey: env.RELAY_SEAL_PUBLIC_KEY,
       verifyKey: env.RELAY_VERIFY_PUBLIC_KEY,
       ownerUserId: env.RELAY_OWNER_USER_ID,
+      allowBots: new Set((env.RELAY_ALLOW_BOTS ?? '').split(',').map(s => s.trim()).filter(Boolean)),
       store: store(env.DB),
       maxAgeMs: maxAgeMs(env),
     })(req),

@@ -355,7 +355,7 @@ export async function run(cfg: Config) {
     let newestAt = 0
     for (const channel of active.keys()) {
       try {
-        newestAt = Math.max(newestAt, await newestMessageAt(cfg.userToken, channel))
+        newestAt = Math.max(newestAt, await newestMessageAt(cfg.userToken, channel, id, cfg.allowBots))
       } catch (e) {
         log(`delivery check ${channel} failed: ${(e as Error).message}`) // says nothing about delivery, so not a stall
       }

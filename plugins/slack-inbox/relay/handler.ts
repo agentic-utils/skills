@@ -1,6 +1,7 @@
 // The hosted half of relay mode: receives Slack's Events API posts, seals each event to the user's public key and
 // queues the ciphertext for their machine to pull, keeping it for a while so it can be replayed. Web standards only, so it runs on Workers and under Bun tests.
 // It holds no Slack token and can't read what it has stored.
+import { type EventsApiPayload, passesRelay } from '../src/match'
 
 export type Queued = { id: number; sealed: string }
 
@@ -15,6 +16,7 @@ export type RelayConfig = {
   sealKey: string // base64 raw X25519 public key
   verifyKey: string // base64 raw Ed25519 public key, for pull requests
   ownerUserId: string
+  allowBots?: Set<string> // the listener's allow_bots: other bots are never stored
   store: Store
   maxAgeMs?: number
   now?: () => number
@@ -149,6 +151,8 @@ export function createRelay(c: RelayConfig) {
     if (p.type !== 'event_callback' || typeof p.event_id !== 'string') return json({})
     // Another user who installs this app would have their events sealed to this key, so those never get stored
     if (!(p.authorizations ?? []).some((a: { user_id?: string }) => a.user_id === c.ownerUserId)) return json({})
+    // Each stored event costs D1 writes, and on a busy workspace most are bots and edits the listener drops unread
+    if (!passesRelay(p as EventsApiPayload, { userId: c.ownerUserId, teamId: p.team_id ?? '' }, c.allowBots ?? new Set())) return json({})
     // Stored before answering: an instance can be stopped once it has answered, and a retry is harmless
     let timer: ReturnType<typeof setTimeout> | undefined
     const over = new Promise<'over'>(resolve => {
