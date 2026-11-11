@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { checkConversation } from './slack'
+import { checkConversation, newestMessageAt } from './slack'
 
 const real = globalThis.fetch
 afterEach(() => {
@@ -26,4 +26,15 @@ test('checkConversation accepts members, and accepts unverified when it cannot a
   slack({ ok: false, error: 'missing_scope' })
   expect(await checkConversation('xoxp-1', 'D1AB')).toMatchObject({ ok: true, note: expect.stringContaining('im:read') })
   expect(await checkConversation(undefined, 'C1AB')).toMatchObject({ ok: true, note: expect.stringContaining('no user token') })
+})
+
+test('newestMessageAt skips what the relay drops, so a chatty bot reads as no stall', async () => {
+  const me = { userId: 'UME', teamId: 'T1' }
+  slack({ ok: true, messages: [{ type: 'message', subtype: 'bot_message', bot_id: 'B1', ts: '30' }, { type: 'message', user: 'UOTHER', bot_id: 'B2', ts: '20' }, { type: 'message', user: 'UOTHER', ts: '10' }] })
+  expect(await newestMessageAt('xoxp-1', 'C1', me, new Set())).toBe(10_000)
+  expect(await newestMessageAt('xoxp-1', 'C1', me, new Set(['B1']))).toBe(30_000)
+  slack({ ok: true, messages: [{ type: 'message', user: 'UME', bot_id: 'BCLAUDE', ts: '40' }] })
+  expect(await newestMessageAt('xoxp-1', 'C1', me, new Set())).toBe(40_000)
+  slack({ ok: true, messages: [{ type: 'message', subtype: 'bot_message', bot_id: 'B1', ts: '30' }] })
+  expect(await newestMessageAt('xoxp-1', 'C1', me, new Set())).toBe(0)
 })

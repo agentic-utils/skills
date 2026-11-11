@@ -65,6 +65,13 @@ export function screen(payload: EventsApiPayload, me: Me, allowBots: Set<string>
   return { message: m, external }
 }
 
+// Whether the relay stores an event: only what screen keeps, plus the user's own messages. Everything else would be
+// dropped by the listener and replay anyway, and on a busy workspace bots are most of the traffic and of D1's writes.
+export const passesRelay = (payload: EventsApiPayload, me: Me, allowBots: Set<string>) => {
+  const s = screen(payload, me, allowBots)
+  return !('skip' in s) || s.skip === 'own'
+}
+
 const SUBTEAM = /<!subteam\^([A-Z0-9]+)/g
 
 // Every trigger the message hits. `inThread` says whether the user started or replied in the message's thread; the

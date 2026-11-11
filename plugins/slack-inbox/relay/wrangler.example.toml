@@ -15,4 +15,5 @@ database_id = "local"
 RELAY_SEAL_PUBLIC_KEY = "from `slack-inbox relay-keygen`"
 RELAY_VERIFY_PUBLIC_KEY = "from `slack-inbox relay-keygen`"
 RELAY_OWNER_USER_ID = "your Slack user id"
+# RELAY_ALLOW_BOTS = "B0123456789" # the listener's allow_bots, comma separated: other bots' messages are never stored
 # SLACK_SIGNING_SECRET is a secret, never a var: `wrangler secret put SLACK_SIGNING_SECRET`
