@@ -1418,7 +1418,8 @@ async function polling(e: Env, msg: string, sid: string, sha: string) {
   await Bun.sleep(50) // comments from here on are newer than the subscription
   return { d, s, reply }
 }
-const hellos = (s: { got: { content: string }[] }, id: number) => s.got.filter(g => g.content.endsWith(`hello ${id}`)).length
+// a comment's body ends its first part; held notices may follow it
+const hellos = (s: { got: { content: string }[] }, id: number) => s.got.filter(g => g.content.split('\n\nMeanwhile, no action needed:')[0].endsWith(`hello ${id}`)).length
 // A comment, review, label or push bumps the PR's updated_at on GitHub, which is what a poll looks for
 const touchPr = (e: Env, sha: string) => serve(e, 'repos/o/r/pulls/7', { html_url: 'https://github.com/o/r/pull/7', head: { sha }, updated_at: new Date().toISOString() })
 
