@@ -246,6 +246,7 @@ export async function startDaemon() {
     if (!s.held.length) return ''
     const tail = `\n\nMeanwhile, no action needed:\n${s.held.map(h => `- ${h}`).join('\n')}`
     s.held = []
+    save() // or a restart hands them over again
     return tail
   }
   // To each open stream of the session, or queued for when it reconnects. A quiet one is held instead (first line
