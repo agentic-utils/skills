@@ -88,6 +88,18 @@ export function summarise(event: string, p: any): Event {
         text: `Checks ${s.conclusion} (${s.app?.name}) on ${s.head_sha.slice(0, 7)}\nhttps://github.com/${repo}/pull/${pr}/checks`,
       }
     }
+    case 'status': {
+      // commit statuses (DeepSource, among others, reports only through these): GitHub's payload names no PR, so
+      // the daemon adds pull_requests from the subscribed PRs whose head is this sha
+      if (!['success', 'failure', 'error'].includes(p.state)) return null
+      const pr = p.pull_requests?.[0]?.number
+      if (!pr) return null
+      const desc = p.description ? `: ${clip(p.description, 200)}` : ''
+      return {
+        pr,
+        text: `Status ${p.context} ${p.state} on ${String(p.sha).slice(0, 7)}${desc}\n${p.target_url || `https://github.com/${repo}/pull/${pr}/checks`}`,
+      }
+    }
     case 'workflow_run': {
       // one per workflow per push; pull_requests is empty for runs from forks
       const w = p.workflow_run

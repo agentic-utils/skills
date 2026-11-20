@@ -19,7 +19,9 @@
 //   through the catch-up path when the PR changes, only its head CI when just that changes, or in full every 30 min; the forward is retried after
 //   5 min, doubling to hourly (hourly from the start without admin), switching back to live with a catch-up from the
 //   last poll once it starts; polling stops with the repo's last subscription;
-// - a session gets every event for its PRs: live while connected, queued (up to 100) while not;
+// - a session gets every event for its PRs: live while connected, queued (up to 100) while not; routine ones (a CI
+//   success, polling notices, the end of a watch) are held (up to 30) and appended to its next event or tool reply,
+//   since each channel event starts a turn, and a head whose every check and status passed is announced once;
 // - a merged PR stays subscribed for the grace window (60 min) so late reviews and bot comments still arrive, then
 //   is unsubscribed, its sessions told; one closed without merging stays subscribed for the reopen window (24h) and
 //   is unsubscribed, its sessions told, if it isn't reopened in time; both windows survive a restart and are
@@ -52,6 +54,7 @@
 //      GH_PR_EVENTS_IDLE_POLL_SECONDS (how often once its PRs are quiet for 30 min, default 300),
 //      GH_PR_EVENTS_RECHECK_SECONDS (least time between mergeability checks of a PR, default 60),
 //      GH_PR_EVENTS_FORWARD_RETRY_MS (tests only: how often a polled repo's forward is retried, default 300000),
+//      GH_PR_EVENTS_GREEN_DELAY_MS (tests only: wait after a CI success before checking the head is green, default 15000),
 //      GH_PR_EVENTS_BEAT_DIR - if set, touch <dir>/<owner>_<repo>_<n> every few minutes per watched PR
 //      (lets a Stop hook check a PR is still being watched), GH_PR_EVENTS_FORWARDER and GH_PR_EVENTS_GH (tests only: stand-ins for gh-webhook and gh),
 //      GH_PR_EVENTS_GAP_MS and GH_PR_EVENTS_RETRY_MS (tests only: how late the 5s timer must fire to count as a
