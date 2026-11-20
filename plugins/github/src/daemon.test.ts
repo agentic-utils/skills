@@ -250,6 +250,94 @@ test(
 )
 
 test(
+  "a commit status (DeepSource's way of reporting) reaches the PR whose head it's on, though GitHub names no PR",
+  async () => {
+    const e = setup({ FAKE_HEAD: 'abcdef21', FAKE_GH_LOG: '' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    const d = await daemon(e)
+    const s = stream(d, 'sess-st')
+    await call(d, 'sess-st', 'subscribe_pr', 'o/r#7')
+    const [[, args]] = await up(e)
+    expect(args).toContain(',status,')
+    // the subscribe's mergeability check is where the daemon learns the head
+    await until('mergeability check', () => existsSync(e.env.FAKE_GH_LOG) && readFileSync(e.env.FAKE_GH_LOG, 'utf8').includes('mergeability'))
+    await Bun.sleep(200)
+    const status = (id: number, sha: string, state: string) =>
+      hook(d, secretOf(args), 'status', {
+        id,
+        sha,
+        state,
+        context: 'DeepSource: Python',
+        description: 'Analysis failed',
+        target_url: 'https://app.deepsource.com/x',
+        repository: { full_name: 'o/r' },
+        sender: { login: 'deepsource-io[bot]' },
+      })
+    await status(1, 'abcdef21', 'pending') // not a result
+    await status(2, '1234567f', 'failure') // another commit
+    await status(3, 'abcdef21', 'failure')
+    await until('the status', () => s.got.length)
+    await Bun.sleep(300)
+    expect(s.got).toEqual([
+      {
+        content: 'o/r#7: Status DeepSource: Python failure on abcdef2: Analysis failed\nhttps://app.deepsource.com/x',
+        meta: { event: 'status', repo: 'o/r', pr: '7' },
+      },
+    ])
+    await s.close()
+  },
+  T,
+)
+
+test(
+  'CI successes are held, and the session is woken once, when every check and status on the head has passed',
+  async () => {
+    const sha = 'abcdef23'
+    const e = setup({ FAKE_HEAD: sha, FAKE_GH_LOG: '', GH_PR_EVENTS_GREEN_DELAY_MS: '300' })
+    e.env.FAKE_GH_LOG = `${e.api}/../gh.log`
+    const d = await daemon(e)
+    const s = stream(d, 'sess-green')
+    await call(d, 'sess-green', 'subscribe_pr', 'o/r#7')
+    const [[, args]] = await up(e)
+    await until('mergeability check', () => existsSync(e.env.FAKE_GH_LOG) && readFileSync(e.env.FAKE_GH_LOG, 'utf8').includes('mergeability'))
+    await Bun.sleep(200)
+    const run = (id: number, name: string) =>
+      hook(d, secretOf(args), 'workflow_run', {
+        action: 'completed',
+        repository: { full_name: 'o/r' },
+        sender: { login: 'amy' },
+        workflow_run: { id, run_attempt: 1, name, conclusion: 'success', head_sha: sha, html_url: `https://github.com/o/r/actions/runs/${id}`, pull_requests: [{ number: 7 }] },
+      })
+    const checkRun = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion })
+    // one workflow done, another still running: nothing wakes the session
+    serve(e, `repos/o/r/commits/${sha}/check-runs`, { check_runs: [checkRun('lint', 'completed', 'success'), checkRun('test', 'in_progress', null)] })
+    serve(e, `repos/o/r/commits/${sha}/status`, { state: 'success', statuses: [{ context: 'DeepSource: Python', state: 'success' }] })
+    await run(1, 'lint')
+    await until('the first green check', () => readFileSync(e.env.FAKE_GH_LOG, 'utf8').includes(`call repos/o/r/commits/${sha}/check-runs`))
+    await Bun.sleep(500)
+    expect(s.got).toEqual([])
+    expect(held(e, 'sess-green')).toEqual([`o/r#7: Workflow lint success on ${sha.slice(0, 7)}`])
+    // the last one finishes: one event, with the successes it held
+    serve(e, `repos/o/r/commits/${sha}/check-runs`, { check_runs: [checkRun('lint', 'completed', 'success'), checkRun('test', 'completed', 'skipped')] })
+    await run(2, 'test')
+    await until('green', () => s.got.length)
+    expect(s.got[0]).toEqual({
+      content:
+        `o/r#7: All checks passed on abcdef2 (2 check runs, 1 status)\nhttps://github.com/o/r/pull/7/checks\n\nMeanwhile, no action needed:\n` +
+        `- o/r#7: Workflow lint success on abcdef2\n- o/r#7: Workflow test success on abcdef2`,
+      meta: { event: 'checks_green', repo: 'o/r', pr: '7' },
+    })
+    // a re-run's success on the same head is held, and doesn't wake it again
+    await run(3, 'test')
+    await Bun.sleep(1000)
+    expect(s.got).toHaveLength(1)
+    expect(held(e, 'sess-green')).toEqual([`o/r#7: Workflow test success on abcdef2`])
+    await s.close()
+  },
+  T,
+)
+
+test(
   'an event for a session with no open stream is queued and delivered when it reconnects',
   async () => {
     const e = setup()
@@ -858,6 +946,16 @@ const serve = (e: Env, path: string, value: unknown) => writeFileSync(`${e.api}/
 const body = (g: { content: string }) => g.content.replace(/^[\w.-]+\/[\w.-]+#\d+: /, '') // without the PR name
 const recovered = (s: { got: { content: string }[] }) => s.got.filter(g => body(g).startsWith('(recovered after a gap) '))
 const errors = (s: { got: { meta: Record<string, string> }[] }) => s.got.filter(g => g.meta.event === 'channel_error')
+// Routine notices a session hasn't been handed yet: held in sessions.json for its next event or tool reply.
+const held = (e: Env, sid: string): string[] => {
+  try {
+    return JSON.parse(readFileSync(`${e.dir}/sessions.json`, 'utf8'))[sid]?.held ?? []
+  } catch {
+    return []
+  }
+}
+// Everything a session was told: delivered, or held for its next event.
+const told = (e: Env, s: { got: { content: string }[] }, sid: string) => [...s.got.map(g => g.content), ...held(e, sid)].join('\n')
 const newForwarder = (e: Env, old: number) =>
   until('a new forwarder', () => {
     const r = running(e)
@@ -868,6 +966,8 @@ const quietPr = (e: Env, sha: string) => {
   for (const p of ['repos/o/r/issues/7/events', 'repos/o/r/issues/7/comments', 'repos/o/r/pulls/7/comments', 'repos/o/r/pulls/7/reviews']) serve(e, p, [])
   serve(e, 'repos/o/r/actions/runs', { workflow_runs: [] })
   serve(e, `repos/o/r/commits/${sha}/check-suites`, { check_suites: [] })
+  serve(e, `repos/o/r/commits/${sha}/statuses`, [])
+  serve(e, `repos/o/r/commits/${sha}/status`, { statuses: [] })
 }
 
 test(
@@ -913,7 +1013,7 @@ test(
     await Bun.sleep(7000)
     process.kill(d.pid, 'SIGCONT')
     const [, args] = await newForwarder(e, first)
-    await until('recovered events', () => recovered(s).length === 8)
+    await until('recovered events', () => recovered(s).length === 7)
     await Bun.sleep(300)
     const got = recovered(s).map(g => body(g).replace('(recovered after a gap) ', '').split('\n')[0])
     expect(got).toEqual([
@@ -923,9 +1023,12 @@ test(
       'Comment by amy',
       'Review comment by cy on a.ts:3',
       'Review approved by dee',
-      'Workflow ci success on bbbbbbb',
       'Checks failure (Circle) on bbbbbbb',
     ])
+    // a success doesn't start a turn of its own: it comes with the next event that does
+    expect(s.got.find(g => g.content.includes('Checks failure'))!.content).toEndWith(
+      '\n\nMeanwhile, no action needed:\n- o/r#7: (recovered after a gap) Workflow ci success on bbbbbbb',
+    )
     expect(recovered(s).find(g => g.content.includes('hello 901'))!.meta).toEqual({ event: 'issue_comment', repo: 'o/r', pr: '7' })
     expect(errors(s)).toEqual([])
 
@@ -1222,13 +1325,14 @@ test(
     await call(d, 'sess-gone', 'subscribe_pr', 'o/r#7')
     const [[, args]] = await up(e)
     await closedHook(d, secretOf(args), false)
-    await until('expiry notice', () => s.got.some(g => g.content.includes('unsubscribed automatically')), 20_000)
-    expect(s.got.map(g => g.content.split('\n')[0])).toEqual([
-      'o/r#7: PR closed without merging by amy',
-      'o/r#7: Still closed after 0.001h; unsubscribed automatically',
-    ])
+    await until('expiry notice', () => held(e, 'sess-gone').length, 20_000)
+    // the end of a watch is held, not a turn of its own, and handed over with the next tool reply
+    expect(s.got.map(g => g.content.split('\n')[0])).toEqual(['o/r#7: PR closed without merging by amy'])
     await until('forwarder stopped', () => running(e).length === 0)
-    expect((await call(d, 'sess-gone', 'unsubscribe_pr', 'o/r#7')).text).toBe('subscribed: none')
+    expect((await call(d, 'sess-gone', 'unsubscribe_pr', 'o/r#7')).text).toBe(
+      'subscribed: none\n\nMeanwhile, no action needed:\n- o/r#7: Still closed after 0.001h; unsubscribed automatically',
+    )
+    expect(held(e, 'sess-gone')).toEqual([])
     await s.close()
   },
   T,
@@ -1254,16 +1358,14 @@ test(
     await closedHook(d, secretOf(args), true)
     await reviewCommentHook(d, secretOf(args), 901)
     await until('late review comment', () => s.got.some(g => g.content.includes('late 901')))
-    await until('window over', () => errors(s).length, 20_000)
+    await until('window over', () => held(e, 'sess-grace').length, 20_000)
     await Bun.sleep(5500) // another check: still only one notice
-    expect(s.got.map(g => g.content.split('\n')[0])).toEqual([
-      'o/r#7: PR merged by amy',
-      'o/r#7: Review comment by gemini on a.ts:3',
-      expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/),
-    ])
-    expect(errors(s).length).toBe(1)
+    expect(s.got.map(g => g.content.split('\n')[0])).toEqual(['o/r#7: PR merged by amy', 'o/r#7: Review comment by gemini on a.ts:3'])
+    expect(held(e, 'sess-grace')).toEqual([expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/)])
     await until('forwarder stopped', () => running(e).length === 0)
-    expect((await call(d, 'sess-grace', 'unsubscribe_pr', 'o/r#7')).text).toBe('subscribed: none')
+    expect((await call(d, 'sess-grace', 'unsubscribe_pr', 'o/r#7')).text).toMatch(
+      /^subscribed: none\n\nMeanwhile, no action needed:\n- stopped watching o\/r#7, merged \d+m ago$/,
+    )
     await s.close()
   },
   T,
@@ -1289,8 +1391,9 @@ test(
     await until('recovered comment', () => recovered(s).some(g => g.content.includes('hello 902')))
     await reviewCommentHook(d2, secretOf(a2), 903)
     await until('late review comment', () => s.got.some(g => g.content.includes('late 903')))
-    await until('window over', () => errors(s).length, 30_000)
-    expect(errors(s).map(g => g.content)).toEqual([expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/)])
+    await until('window over', () => held(e, 'sess-grace2').length, 30_000)
+    expect(held(e, 'sess-grace2')).toEqual([expect.stringMatching(/^stopped watching o\/r#7, merged \d+m ago$/)])
+    expect(errors(s)).toEqual([])
     await until('forwarder stopped', () => running(e).length === 0)
     await s.close()
   },
@@ -1308,10 +1411,12 @@ async function polling(e: Env, msg: string, sid: string, sha: string) {
   quietPr(e, sha)
   const d = await daemon(e)
   const s = stream(d, sid)
-  expect((await call(d, sid, 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
-  await until('polling notice', () => s.got.length)
+  await until('stream', s.connected)
+  // GitHub's refusal is handled before the reply is written, so the reply carries the polling notice
+  const reply = (await call(d, sid, 'subscribe_pr', 'o/r#7')).text
+  expect(reply).toStartWith('subscribed: o/r#7\n\nMeanwhile, no action needed:\n- pr-events: polling o/r#7 every ')
   await Bun.sleep(50) // comments from here on are newer than the subscription
-  return { d, s }
+  return { d, s, reply }
 }
 const hellos = (s: { got: { content: string }[] }, id: number) => s.got.filter(g => g.content.endsWith(`hello ${id}`)).length
 // A comment, review, label or push bumps the PR's updated_at on GitHub, which is what a poll looks for
@@ -1325,13 +1430,14 @@ for (const [why, msg] of [
     `a forward refused (${why}) falls back to polling, and events still arrive`,
     async () => {
       const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1' })
-      const { s } = await polling(e, msg, 'sess-poll', 'abcdef09')
-      expect(s.got[0]).toEqual({ content: `pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: ${why})`, meta: { event: 'polling' } })
+      const { s, reply } = await polling(e, msg, 'sess-poll', 'abcdef09')
+      expect(reply).toEndWith(`- pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: ${why})`)
+      expect(s.got).toEqual([]) // no turn just to say so
       serve(e, 'repos/o/r/issues/7/comments', [apiComment(950, new Date().toISOString())])
       touchPr(e, 'abcdef09')
       await until('polled comment', () => hellos(s, 950))
       await Bun.sleep(2500) // more polls: nothing repeats
-      expect(s.got.map(g => g.content.split('\n')[0])).toEqual([s.got[0].content, 'o/r#7: Comment by amy'])
+      expect(s.got.map(g => g.content.split('\n')[0])).toEqual(['o/r#7: Comment by amy'])
       expect(running(e)).toEqual([])
       await s.close()
     },
@@ -1379,7 +1485,7 @@ test(
     serve(e, 'repos/o/r/issues/7/comments', [c960, c961])
     touchPr(e, 'abcdef10')
     const [[, args]] = await up(e)
-    await until('live again', () => s.got.some(g => g.content === 'pr-events: forwarding o/r#7 live again'))
+    await until('live again', () => told(e, s, 'sess-switch').includes('pr-events: forwarding o/r#7 live again'))
     await until('caught up', () => hellos(s, 961))
     await commentHook(d, secretOf(args), c961) // a live repeat of what polling already delivered
     await commentHook(d, secretOf(args), apiComment(962, new Date().toISOString()))
@@ -1454,7 +1560,7 @@ test(
     const probes = () => (existsSync(e.env.FAKE_GH_LOG) ? readFileSync(e.env.FAKE_GH_LOG, 'utf8') : '').match(/call repos\/o\/r\/pulls\/7 inm="pr1"/g)?.length ?? 0
     await until('a conditional probe', probes)
     writeFileSync(`${e.api}/repos_o_r_pulls_7.limit`, `100 ${Math.ceil(Date.now() / 1000) + 5} 5000\n`)
-    const paused = () => s.got.filter(g => g.content.includes('paused until'))
+    const paused = () => told(e, s, 'sess-limit').match(/paused until/g) ?? []
     await until('pause notice', () => paused().length)
     rmSync(`${e.api}/repos_o_r_pulls_7.limit`)
     await Bun.sleep(1500) // anything in flight lands
@@ -1480,7 +1586,7 @@ test(
     writeFileSync(`${e.api}/repos_o_r_pulls_7.limit`, `56 ${Math.ceil(Date.now() / 1000) + 60} 60\n`)
     const before = probes()
     await until('more probes', () => probes() >= before + 3)
-    expect(s.got.filter(g => g.content.includes('paused until'))).toEqual([])
+    expect(told(e, s, 'sess-anon')).not.toContain('paused until')
     await s.close()
   },
   T,
@@ -1494,9 +1600,9 @@ test(
     serve(e, 'repos/o/r', { full_name: 'o/r', permissions: { admin: false, push: true, pull: true } })
     const d = await daemon(e)
     const s = stream(d, 'sess-noadmin')
-    expect((await call(d, 'sess-noadmin', 'subscribe_pr', 'o/r#7')).text).toBe('subscribed: o/r#7')
-    await until('polling notice', () => s.got.length)
-    expect(s.got[0].content).toBe('pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: no admin on the repo)')
+    expect((await call(d, 'sess-noadmin', 'subscribe_pr', 'o/r#7')).text).toBe(
+      'subscribed: o/r#7\n\nMeanwhile, no action needed:\n- pr-events: polling o/r#7 every 1s, every 300s once quiet for 30 min (forward unavailable: no admin on the repo)',
+    )
     serve(e, 'repos/o/r/issues/7/comments', [apiComment(980, new Date().toISOString())])
     touchPr(e, 'abcdef13')
     await until('polled comment', () => hellos(s, 980))
@@ -1528,6 +1634,24 @@ test(
     expect(count(/call repos\/o\/r\/issues\/7\/comments/g)).toBe(comments) // no full catch-up
     expect(hellos(s, 990)).toBe(0)
     expect(s.got.filter(g => g.content.includes('Checks failure')).length).toBe(1) // later CI-only polls don't repeat it
+    await s.close()
+  },
+  T,
+)
+
+test(
+  "a polled PR's new commit status is found by probing the head's combined status",
+  async () => {
+    const e = setup({ GH_PR_EVENTS_POLL_SECONDS: '1' })
+    writeFileSync(`${e.api}/repos_o_r_pulls_7.etag`, '"pr1"')
+    const { s } = await polling(e, NO_ADMIN, 'sess-st-poll', 'abcdef22')
+    const t = new Date().toISOString()
+    const st = { id: 77, state: 'failure', context: 'DeepSource: Secrets', description: 'Secrets found', target_url: 'https://app.deepsource.com/y', creator: { login: 'deepsource-io[bot]' }, updated_at: t }
+    serve(e, 'repos/o/r/commits/abcdef22/statuses', [st, { ...st, id: 76, state: 'pending' }])
+    serve(e, 'repos/o/r/commits/abcdef22/status', { repository: { pushed_at: t }, statuses: [st] })
+    await until('the status', () => s.got.some(g => g.content.startsWith('o/r#7: Status DeepSource: Secrets failure on abcdef2')))
+    await Bun.sleep(2500) // later polls don't repeat it
+    expect(s.got.filter(g => g.meta.event === 'status')).toHaveLength(1)
     await s.close()
   },
   T,

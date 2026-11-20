@@ -76,6 +76,11 @@ test('summarise', () => {
   expect(run('cancelled', [{ number: 7 }])).toBeNull()
   expect(run('failure', [])).toBeNull()
   expect(summarise('check_suite', { ...base, action: 'completed', check_suite: { conclusion: 'failure', pull_requests: [] } })).toBeNull()
+  const status = (state: string, prs: object[] = [{ number: 7 }]) =>
+    summarise('status', { ...base, sha: 'abcdef12', state, context: 'DeepSource: Python', description: 'Failed', target_url: 't', pull_requests: prs })
+  expect(status('failure')).toEqual({ pr: 7, text: 'Status DeepSource: Python failure on abcdef1: Failed\nt' })
+  expect(status('pending')).toBeNull()
+  expect(status('error', [])).toBeNull() // the daemon names the PR from its head; GitHub never does
 })
 
 test('parsePr', () => {

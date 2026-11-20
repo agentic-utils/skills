@@ -7,9 +7,10 @@ import { version } from '../.claude-plugin/plugin.json'
 import { beatName, parsePr, summarise, verified, type Event } from './events'
 import { alive, daemonFile, isDaemon, log, privateStateDir, proof, reachable, readJson, writeJson, type DaemonInfo } from './state'
 
-// push: only to spot base-branch moves that cause merge conflicts, never emitted itself
+// push: only to spot base-branch moves that cause merge conflicts, never emitted itself. status: commit statuses,
+// which some CI (DeepSource) reports through instead of check runs
 const events =
-  'pull_request,pull_request_review,pull_request_review_comment,pull_request_review_thread,issue_comment,check_suite,workflow_run,push'
+  'pull_request,pull_request_review,pull_request_review_comment,pull_request_review_thread,issue_comment,check_suite,workflow_run,status,push'
 const cancelledMsg = 'unsubscribed while the forwarder started'
 // our forwarder's argv, as `ps` shows it; group 1 is the repo
 const forwarderArgs = / forward --repo=(\S+) --events=\S+ --url=http:\/\/127\.0\.0\.1:/
@@ -46,14 +47,22 @@ const SWEEP_MS = 30 * 60_000 // a polled PR is caught up in full this often even
 const TAKEN = /already exists/i
 const NO_ADMIN = /HTTP 40[34]|Not Found|admin|Resource not accessible/i
 const GRACE_MS = Number(process.env.GH_PR_EVENTS_MERGED_GRACE_MINUTES ?? 60) * 60_000 // keep a merged PR this long for late reviews
+// Claude Code starts a turn for every channel event, so routine notices (a CI success, a polling notice, the end of a
+// watch) are held per session and handed over with its next event or tool reply instead; at most this many
+const HELD_MAX = 30
+// after a CI success, wait this long for more before asking whether the whole head is green (env: tests only)
+const GREEN_DELAY_MS = Number(process.env.GH_PR_EVENTS_GREEN_DELAY_MS ?? 15_000)
+const PASSED = ['success', 'neutral', 'skipped']
 
-type Ev = { content: string; meta: Record<string, string> }
+// quiet: held for the session's next event or tool reply rather than delivered on its own (see HELD_MAX)
+type Ev = { content: string; meta: Record<string, string>; quiet?: boolean }
 // A Claude session, known by its CLAUDE_CODE_SESSION_ID, which survives --resume. Streams: its shims' open event streams.
 // dropped: queued events lost to the cap since it last connected. expired: what the TTL took from it, kept (a tombstone)
 // for another TTL so it's told when it comes back. ephemeral: no CLAUDE_CODE_SESSION_ID, so it ends with its stream.
 type Session = {
   subs: Map<string, string>
   pending: Ev[]
+  held: string[]
   dropped: number
   lastSeen: number
   beatDir?: string
@@ -79,8 +88,9 @@ type Done = { id: string; t: number; r?: true }
 // start); gap: set while it's behind, where the catch-up must start from; at: when it was subscribed (nothing older
 // is recovered); gen: bumped each time it falls behind, so a catch-up only closes a gap that didn't reopen while it
 // ran; done: what it already delivered; head: its head sha; closed: when it was closed without merging, if it still is;
-// merged: when it merged (it's watched for late comments until GRACE_MS after).
-type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number; merged?: number }
+// merged: when it merged (it's watched for late comments until GRACE_MS after); green: the last head its sessions were
+// told passed every check.
+type Seen = { since: number; gap?: number; gen?: number; at: number; done: Done[]; head?: string; closed?: number; merged?: number; green?: string }
 
 // owner/repo of an API path such as repos/o/r/pulls/7?x=1
 const repoOf = (path: string) => path.split('?')[0].split('/').slice(1, 3).join('/').toLowerCase()
@@ -98,6 +108,8 @@ function idOf(event: string, p: any): string | undefined {
       return `w${p.workflow_run?.id}.${p.workflow_run?.run_attempt}`
     case 'check_suite':
       return `cs${p.check_suite?.id}@${p.check_suite?.updated_at}`
+    case 'status':
+      return `st${p.id}`
     case 'pull_request':
       if (p.action === 'synchronize') return `push${p.after}`
       return p.issueEvent ? `ie${p.issueEvent}` : actionOf(p) // issueEvent: set on a recovered one
@@ -212,7 +224,7 @@ export async function startDaemon() {
 
   const session = (id: string) => {
     let s = sessions.get(id)
-    if (!s) sessions.set(id, (s = { subs: new Map(), pending: [], dropped: 0, lastSeen: Date.now(), streams: new Set() }))
+    if (!s) sessions.set(id, (s = { subs: new Map(), pending: [], held: [], dropped: 0, lastSeen: Date.now(), streams: new Set() }))
     return s
   }
   const save = () => {
@@ -220,8 +232,8 @@ export async function startDaemon() {
     try {
       const out: Record<string, object> = {}
       for (const [id, s] of sessions)
-        if (!s.ephemeral && (s.subs.size || s.pending.length || s.dropped || s.expired))
-          out[id] = { subs: [...s.subs.values()], pending: s.pending, dropped: s.dropped, lastSeen: s.lastSeen, beatDir: s.beatDir, expired: s.expired }
+        if (!s.ephemeral && (s.subs.size || s.pending.length || s.held.length || s.dropped || s.expired))
+          out[id] = { subs: [...s.subs.values()], pending: s.pending, held: s.held, dropped: s.dropped, lastSeen: s.lastSeen, beatDir: s.beatDir, expired: s.expired }
       // not a valid session id, so a 2.0 daemon skips it; only PRs a saved session watches
       out['#seen'] = Object.fromEntries([...seen].filter(([k]) => [...(subs.get(k)?.sessions ?? [])].some(id => !sessions.get(id)?.ephemeral)))
       writeJson(sessionsFile, out)
@@ -229,10 +241,25 @@ export async function startDaemon() {
       log('could not save sessions:', e)
     }
   }
-  // To each open stream of the session, or queued for when it reconnects.
-  const deliver = (id: string, e: Ev) => {
+  // The session's held notices, once, as a tail for whatever it's told next.
+  const heldTail = (s: Session) => {
+    if (!s.held.length) return ''
+    const tail = `\n\nMeanwhile, no action needed:\n${s.held.map(h => `- ${h}`).join('\n')}`
+    s.held = []
+    return tail
+  }
+  // To each open stream of the session, or queued for when it reconnects. A quiet one is held instead (first line
+  // only: the PR's name and what happened), and goes out with the next one that isn't.
+  const deliver = (id: string, ev: Ev) => {
     const s = sessions.get(id)
     if (!s || stopped || !owned()) return
+    if (ev.quiet) {
+      if (s.held.length >= HELD_MAX) s.held.shift()
+      s.held.push(ev.content.split('\n')[0])
+      save()
+      return
+    }
+    const e: Ev = { content: ev.content + heldTail(s), meta: ev.meta }
     let sent = false
     for (const stream of s.streams) sent = stream(e) || sent
     if (sent) return
@@ -243,9 +270,9 @@ export async function startDaemon() {
   // Claude Code shows a notification as one line cut at the terminal width, rendering no markdown, so each PR
   // event starts with the PR's name (owner/repo#n): it survives the cut where the URL doesn't.
   const label = (sub: Sub, content: string) => `${sub.pr}: ${content}`
-  const emitTo = (key: string, content: string, meta: Record<string, string>) => {
+  const emitTo = (key: string, content: string, meta: Record<string, string>, quiet = false) => {
     const sub = subs.get(key)
-    for (const id of sub?.sessions ?? []) deliver(id, { content: label(sub!, content), meta })
+    for (const id of sub?.sessions ?? []) deliver(id, { content: label(sub!, content), meta, quiet })
   }
   // Drops a repo's subscriptions and tells their sessions, which can resubscribe.
   const dropRepo = (repo: string, why: string) => {
@@ -431,7 +458,7 @@ export async function startDaemon() {
   const pollingMsg = (pr: string, why: string) =>
     `pr-events: polling ${pr} every ${POLL_MS / 1000}s, every ${IDLE_POLL_MS / 1000}s once quiet for ${IDLE_AFTER_MS / 60_000} min (forward unavailable: ${why})`
   const tell = (key: string, content: string) => {
-    for (const id of subs.get(key)?.sessions ?? []) deliver(id, { content, meta: { event: 'polling' } })
+    for (const id of subs.get(key)?.sessions ?? []) deliver(id, { content, meta: { event: 'polling' }, quiet: true })
   }
 
   // Doesn't wait: the next start for the repo waits for the exit instead.
@@ -623,7 +650,7 @@ export async function startDaemon() {
     log(`GitHub allowance low: polling paused until ${at}; ${who}`)
     for (const repo of polled.keys())
       for (const k of inRepo(repo))
-        emitTo(k, `pr-events: polling ${subs.get(k)!.pr} paused until ${at}, GitHub allowance nearly used (${who}); it resumes by itself`, { event: 'polling' })
+        emitTo(k, `pr-events: polling ${subs.get(k)!.pr} paused until ${at}, GitHub allowance nearly used (${who}); it resumes by itself`, { event: 'polling' }, true)
   }
 
   // Whether the resource changed since the last call, by a conditional GET: GitHub answers an unchanged one with a 304,
@@ -670,6 +697,8 @@ export async function startDaemon() {
       (b.requested_reviewers ?? []).map((u: any) => u.login),
       (b.requested_teams ?? []).map((t: any) => t.slug),
     ])
+  // A commit's combined status embeds its repo too: only the statuses themselves count.
+  const statusDigest = (b: any) => JSON.stringify((b.statuses ?? []).map((s: any) => [s.context, s.state, s.updated_at]))
   const mergeableSeen = new Map<string, boolean>() // key -> the last settled mergeable a poll saw
 
   // One poll of a PR in a polled repo: probes the PR and its head's CI conditionally, and catches up only if either
@@ -682,9 +711,10 @@ export async function startDaemon() {
     try {
       const probes = await Promise.all([
         changed(`repos/${repo}/pulls/${n}`, prDigest),
-        ...(c.head ? [changed(`repos/${repo}/commits/${c.head}/check-suites`)] : []),
+        // a commit status (DeepSource's way of reporting) doesn't change the head's check suites, so it's probed too
+        ...(c.head ? [changed(`repos/${repo}/commits/${c.head}/check-suites`), changed(`repos/${repo}/commits/${c.head}/status`, statusDigest)] : []),
       ])
-      const [pr, ci] = probes
+      const [pr, ...ci] = probes
       const mergeable = pr.body?.mergeable
       if (typeof mergeable === 'boolean') {
         if (mergeableSeen.has(key) && mergeableSeen.get(key) !== mergeable && !pr.changed) askRecheck(key) // a catch-up asks anyway
@@ -692,7 +722,7 @@ export async function startDaemon() {
       }
       // a new comment, review, label or push changes the PR itself, so CI alone changing needs only the CI
       if (sweep || c.gap !== undefined || pr.changed) await catchUp(key, 0, true)
-      else if (ci?.changed) await ciCatchUp(key)
+      else if (ci.some(p => p.changed)) await ciCatchUp(key)
       if (probes.some(p => p.changed)) sub.changed = Date.now()
       probes.forEach(p => p.keep())
       pollFails.delete(key)
@@ -774,11 +804,16 @@ export async function startDaemon() {
       const shas = [...new Set([c.head, sha].filter(Boolean))] as string[]
       const ci = await Promise.all(
         shas.map(async s => {
-          const [runs, suites] = await Promise.all([
+          const [runs, suites, statuses] = await Promise.all([
             api(`repos/${repo}/actions/runs?per_page=100&head_sha=${s}`, 'list').catch(() => []),
             api(`repos/${repo}/commits/${s}/check-suites?per_page=100`, 'list').catch(() => []),
+            api(`repos/${repo}/commits/${s}/statuses?per_page=100`, 'list').catch(() => []),
           ])
-          return { runs: runs.flatMap((p: any) => p.workflow_runs ?? []), suites: suites.flatMap((p: any) => p.check_suites ?? []) }
+          return {
+            runs: runs.flatMap((p: any) => p.workflow_runs ?? []),
+            suites: suites.flatMap((p: any) => p.check_suites ?? []),
+            statuses: { sha: s, list: statuses },
+          }
         }),
       )
       const runs = [
@@ -826,7 +861,7 @@ export async function startDaemon() {
             event: 'pull_request_review',
             payload: { action: 'submitted', repository, sender: r.user, pull_request: { number: pr }, review: { ...r, state: String(r.state).toLowerCase() } },
           })
-      missed.push(...ciMissed(repo, pr, runs, ci.flatMap(x => x.suites), fresh))
+      missed.push(...ciMissed(repo, pr, runs, ci.flatMap(x => x.suites), ci.map(x => x.statuses), fresh))
       // new commits, from the head commit's author at its commit time
       if (c.head && c.head !== sha) {
         const commit = await api(`repos/${repo}/commits/${sha}`)
@@ -868,7 +903,7 @@ export async function startDaemon() {
 
   // Finished workflow runs and check suites as the webhooks they'd have been.
   type Missed = { t: string; event: string; payload: any }
-  function ciMissed(repo: string, pr: number, runs: any[], suites: any[], fresh: (t?: string | null) => boolean): Missed[] {
+  function ciMissed(repo: string, pr: number, runs: any[], suites: any[], statuses: { sha: string; list: any[] }[], fresh: (t?: string | null) => boolean): Missed[] {
     const repository = { full_name: repo }
     const out: Missed[] = []
     for (const w of runs)
@@ -877,12 +912,16 @@ export async function startDaemon() {
     for (const s of suites)
       if (s.status === 'completed' && fresh(s.updated_at))
         out.push({ t: s.updated_at, event: 'check_suite', payload: { action: 'completed', repository, check_suite: { ...s, pull_requests: [{ number: pr }] } } })
+    for (const { sha, list } of statuses)
+      for (const st of list)
+        if (fresh(st.updated_at))
+          out.push({ t: st.updated_at, event: 'status', payload: { ...st, sha, repository, sender: st.creator, pull_requests: [{ number: pr }] } })
     return out
   }
 
-  // A polled PR whose head's CI changed and nothing else did: just that head's runs and suites (2 calls), not a
-  // whole catch-up (8 or more). It doesn't move `since`, so the next full catch-up still covers the same window; ids
-  // keep anything from repeating.
+  // A polled PR whose head's CI changed and nothing else did: just that head's runs, suites and statuses (3 calls),
+  // not a whole catch-up (9 or more). It doesn't move `since`, so the next full catch-up still covers the same
+  // window; ids keep anything from repeating.
   async function ciCatchUp(key: string): Promise<void> {
     const c = seen.get(key)
     const sub = subs.get(key)
@@ -891,15 +930,17 @@ export async function startDaemon() {
     const [repo, n] = sub.pr.split('#')
     const after = Math.max((c.gap ?? c.since) - SLACK_MS, c.at)
     const fresh = (t?: string | null) => !!t && Date.parse(t) > after
-    const [runs, suites] = await Promise.all([
+    const [runs, suites, statuses] = await Promise.all([
       api(`repos/${repo}/actions/runs?per_page=100&head_sha=${head}`, 'list'),
       api(`repos/${repo}/commits/${head}/check-suites?per_page=100`, 'list'),
+      api(`repos/${repo}/commits/${head}/statuses?per_page=100`, 'list'),
     ])
     const missed = ciMissed(
       repo,
       Number(n),
       runs.flatMap((p: any) => p.workflow_runs ?? []),
       suites.flatMap((p: any) => p.check_suites ?? []),
+      [{ sha: head, list: statuses }],
       fresh,
     ).sort((a, b) => a.t.localeCompare(b.t))
     for (const m of missed) await handle(m.event, m.payload, Date.parse(m.t) || Date.now(), true)
@@ -933,7 +974,7 @@ export async function startDaemon() {
       deliver(id, { ...e, content: label(sub, e.content) })
     }
     const p = polled.get(key.split('#')[0])
-    if (p) deliver(id, { content: pollingMsg(sub.pr, p.why), meta: { event: 'polling' } })
+    if (p) deliver(id, { content: pollingMsg(sub.pr, p.why), meta: { event: 'polling' }, quiet: true })
     return { ready: p ? Promise.resolve(null) : ensureForwarder(key.split('#')[0]) }
   }
 
@@ -972,6 +1013,7 @@ export async function startDaemon() {
       const prs = [...s.subs.values()]
       for (const k of [...s.subs.keys()]) unsubscribe(k, id)
       s.pending = []
+      s.held = []
       s.dropped = 0
       if (prs.length) {
         s.expired = { prs, at: now }
@@ -1001,7 +1043,7 @@ export async function startDaemon() {
       beat()
     } else if (name === 'unsubscribe_pr') await serial(() => unsubscribe(key, id))
     else return { text: `unknown tool: ${name}`, isError: true }
-    return { text: `subscribed: ${[...s.subs.values()].join(', ') || 'none'}` }
+    return { text: `subscribed: ${[...s.subs.values()].join(', ') || 'none'}${heldTail(s)}` }
   }
 
   // ---- HTTP: shims (token) and webhooks (HMAC) ----
@@ -1043,6 +1085,19 @@ export async function startDaemon() {
   // One event, live (HMAC checked) or recovered by a catch-up (fetched from GitHub's API under the user's gh auth;
   // recoveredAt: when it happened).
   async function handle(event: string, payload: any, recoveredAt?: number, polling = false) {
+    // a commit status never names its PR, and a check suite sometimes doesn't: each subscribed PR whose head is
+    // that commit gets it
+    const sha = event === 'status' ? payload.sha : event === 'check_suite' ? payload.check_suite?.head_sha : undefined
+    const prs = event === 'status' ? payload.pull_requests : payload.check_suite?.pull_requests
+    if (typeof sha === 'string' && !prs?.length) {
+      const repo = String(payload.repository?.full_name).toLowerCase()
+      for (const k of inRepo(repo).filter(k => seen.get(k)?.head === sha)) {
+        const pull_requests = [{ number: Number(k.split('#')[1]) }]
+        const p = event === 'status' ? { ...payload, pull_requests } : { ...payload, check_suite: { ...payload.check_suite, pull_requests } }
+        await handle(event, p, recoveredAt, polling)
+      }
+      return
+    }
     const recovered = recoveredAt !== undefined
     let e: Event = null
     try {
@@ -1087,7 +1142,9 @@ export async function startDaemon() {
     }
     const text = recovered && !polling ? RECOVERED + e.text : e.text
     const meta = { event, repo, pr: String(e.pr) }
-    if (!e.done) emitTo(key, text, meta)
+    const ci = ciResult(event, payload)
+    if (ci?.passed) askGreen(key, ci.sha)
+    if (!e.done) emitTo(key, text, meta, !!ci?.passed)
     // closed without merging: it may be reopened, so keep watching for a while (closedCheck ends it)
     else if (!payload.pull_request?.merged && c) {
       c.closed = Date.now()
@@ -1102,6 +1159,47 @@ export async function startDaemon() {
     }
     // in one step, so whoever is subscribed when it's applied is told, including a subscribe that was queued
     else serial(() => (emitTo(key, text + '\n(unsubscribed automatically)', meta), unsubscribe(key)))
+  }
+
+  // A finished CI result's commit and whether it passed.
+  function ciResult(event: string, p: any): { sha: string; passed: boolean } | null {
+    const [sha, outcome] =
+      event === 'workflow_run'
+        ? [p.workflow_run?.head_sha, p.workflow_run?.conclusion]
+        : event === 'check_suite'
+          ? [p.check_suite?.head_sha, p.check_suite?.conclusion]
+          : event === 'status'
+            ? [p.sha, p.state]
+            : []
+    return typeof sha === 'string' ? { sha, passed: outcome === 'success' } : null
+  }
+  // A CI success is held, so the session needs one event that wakes it once the head is green: every check run on it
+  // finished without failing and every commit status succeeded. Successes close together share one look, after
+  // GREEN_DELAY_MS; a look that finds something still running waits for the next success.
+  const greenDue = new Set<string>()
+  function askGreen(key: string, sha: string) {
+    if (seen.get(key)?.green === sha || greenDue.has(key)) return
+    greenDue.add(key)
+    later(() => (greenDue.delete(key), greenCheck(key, sha).catch(e => log(`green check for ${key} failed:`, e))), GREEN_DELAY_MS)
+  }
+  async function greenCheck(key: string, sha: string) {
+    const c = seen.get(key)
+    const sub = subs.get(key)
+    const stale = () => !subs.has(key) || seen.get(key) !== c || c!.green === sha || (!!c!.head && c!.head !== sha)
+    if (!c || !sub || stale()) return
+    const [repo, n] = sub.pr.split('#')
+    const [runs, combined] = await Promise.all([api(`repos/${repo}/commits/${sha}/check-runs?per_page=100`, 'list'), api(`repos/${repo}/commits/${sha}/status`)])
+    const checks: any[] = runs.flatMap((p: any) => p.check_runs ?? [])
+    const statuses: any[] = combined?.statuses ?? []
+    if (!checks.length && !statuses.length) return
+    if (checks.some(r => r.status !== 'completed' || !PASSED.includes(r.conclusion)) || statuses.some(st => st.state !== 'success')) return
+    if (stale()) return
+    c.green = sha
+    save()
+    const what = [checks.length && `${checks.length} check run${checks.length > 1 ? 's' : ''}`, statuses.length && `${statuses.length} status${statuses.length > 1 ? 'es' : ''}`]
+      .filter(Boolean)
+      .join(', ')
+    emitTo(key, `All checks passed on ${sha.slice(0, 7)} (${what})\nhttps://github.com/${repo}/pull/${n}/checks`, { event: 'checks_green', repo, pr: n })
   }
 
   // A shim's event stream: what the session is watching, then anything it missed, then live events, until the shim
@@ -1284,6 +1382,7 @@ export async function startDaemon() {
         head: typeof v.head === 'string' ? v.head : undefined,
         closed: Number.isFinite(v.closed) ? v.closed : undefined,
         merged: Number.isFinite(v.merged) ? v.merged : undefined,
+        green: typeof v.green === 'string' ? v.green : undefined,
       })
   for (const [id, v] of Object.entries(saved)) {
     if (!validSession.test(id) || !v || typeof v !== 'object' || Array.isArray(v)) continue
@@ -1305,6 +1404,7 @@ export async function startDaemon() {
     }
     s.beatDir = typeof v.beatDir === 'string' && isAbsolute(v.beatDir) ? v.beatDir : undefined
     s.pending = (Array.isArray(v.pending) ? v.pending : []).filter((e: any) => typeof e?.content === 'string').slice(-PENDING_MAX)
+    s.held = (Array.isArray(v.held) ? v.held : []).filter((h: unknown) => typeof h === 'string').slice(-HELD_MAX)
     s.dropped = Number.isInteger(v.dropped) && v.dropped > 0 ? v.dropped : 0
     // nothing ran while no daemon did: catch up once the forwarder is back, and keep retrying it until then
     for (const pr of prs) serial(() => (subscribe(id, pr), fellBehind(pr.toLowerCase().split('#')[0])))
@@ -1340,7 +1440,7 @@ export async function startDaemon() {
         serial(() => {
           if (!seen.get(k)?.closed || !subs.has(k)) return
           const [repo, n] = subs.get(k)!.pr.split('#')
-          emitTo(k, `Still closed after ${REOPEN_HOURS}h; unsubscribed automatically`, { event: 'pull_request', repo, pr: n })
+          emitTo(k, `Still closed after ${REOPEN_HOURS}h; unsubscribed automatically`, { event: 'pull_request', repo, pr: n }, true)
           unsubscribe(k)
         })
       if (c.merged && Date.now() - c.merged > GRACE_MS)
@@ -1349,7 +1449,7 @@ export async function startDaemon() {
           const sub = subs.get(k)
           if (!m || !sub) return
           const content = `stopped watching ${sub.pr}, merged ${Math.round((Date.now() - m) / 60_000)}m ago`
-          for (const id of sub.sessions) deliver(id, { content, meta: { event: 'channel_error' } })
+          for (const id of sub.sessions) deliver(id, { content, meta: { event: 'channel_error' }, quiet: true })
           unsubscribe(k)
         })
     }
